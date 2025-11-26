@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
 import httpx
 import os
+import json
 import logging
 from typing import Optional
 from dotenv import load_dotenv
@@ -40,6 +41,29 @@ class SendEmailRequest(BaseModel):
     recipient_name: Optional[str] = None
     custom_message: Optional[str] = None
     campaign_id: Optional[str] = None
+
+
+class CreateCampaignRequest(BaseModel):
+    name: str
+    email_account: Optional[str] = None  # Will use SENDER if not provided
+    subject: str
+    custom_message: Optional[str] = None
+    recipient_name: Optional[str] = None
+
+
+class LaunchCampaignRequest(BaseModel):
+    campaign_id: str
+    recipient_email: EmailStr
+    recipient_name: Optional[str] = None
+
+
+class CreateAndLaunchRequest(BaseModel):
+    name: str
+    subject: str
+    recipient_email: EmailStr
+    email_account: Optional[str] = None
+    custom_message: Optional[str] = None
+    recipient_name: Optional[str] = None
 
 
 app = FastAPI(
@@ -411,6 +435,201 @@ async def send_email(request: SendEmailRequest):
     )
     
     return JSONResponse(content=result)
+
+
+@app.post("/create-campaign")
+async def create_campaign(request: CreateCampaignRequest):
+    """
+    Create a new Instantly.ai campaign with quick reply email template.
+    
+    This endpoint creates a campaign with an email template that includes
+    the quick reply buttons. After creation, you can launch it using /launch-campaign.
+    """
+    if not INSTANTLY_API:
+        raise HTTPException(
+            status_code=500,
+            detail="Instantly API credentials not configured"
+        )
+    
+    email_account = request.email_account or SENDER
+    if not email_account:
+        raise HTTPException(
+            status_code=400,
+            detail="Email account is required. Set INSTANTLY_EACCOUNT or provide email_account in request."
+        )
+    
+    # Create email template
+    template = create_email_template(
+        recipient_name=request.recipient_name or "there",
+        custom_message=request.custom_message
+    )
+    
+    try:
+        logger.info(f"Creating campaign: {request.name}")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Create campaign via Instantly.ai API
+            response = await client.post(
+                "https://api.instantly.ai/api/v2/campaign/create",
+                headers={
+                    "Authorization": f"Bearer {INSTANTLY_API}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "campaign_name": request.name,
+                    "email_account": email_account,
+                    "steps": [
+                        {
+                            "step_number": 1,
+                            "subject": request.subject,
+                            "body": {
+                                "html": template
+                            },
+                            "wait_time": 0  # Send immediately
+                        }
+                    ]
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            logger.info(f"Campaign created successfully: {result}")
+            campaign_id = result.get("campaign_id") or result.get("id") or result.get("data", {}).get("campaign_id")
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Campaign created successfully",
+                "campaign_id": campaign_id,
+                "campaign_name": request.name,
+                "data": result
+            })
+    except httpx.HTTPStatusError as e:
+        error_detail = f"Instantly API error: {e.response.status_code}"
+        try:
+            error_body = e.response.json()
+            error_detail = f"{error_detail} - {error_body}"
+        except:
+            error_detail = f"{error_detail} - {e.response.text}"
+        logger.error(f"HTTP error creating campaign: {error_detail}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=error_detail
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error creating campaign: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create campaign: {str(e)}"
+        )
+
+
+@app.post("/launch-campaign")
+async def launch_campaign(request: LaunchCampaignRequest):
+    """
+    Launch a campaign by adding a lead to it.
+    
+    This adds a recipient to an existing campaign, which will trigger
+    the campaign to send emails according to its schedule.
+    """
+    if not INSTANTLY_API:
+        raise HTTPException(
+            status_code=500,
+            detail="Instantly API credentials not configured"
+        )
+    
+    try:
+        logger.info(f"Launching campaign {request.campaign_id} for {request.recipient_email}")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Add lead to campaign
+            response = await client.post(
+                "https://api.instantly.ai/api/v2/leads/add",
+                headers={
+                    "Authorization": f"Bearer {INSTANTLY_API}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "campaign_id": request.campaign_id,
+                    "leads": [{
+                        "email": request.recipient_email,
+                        "first_name": request.recipient_name or "Customer"
+                    }]
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            logger.info(f"Campaign launched successfully: {result}")
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Campaign launched. Email will be sent according to campaign schedule.",
+                "campaign_id": request.campaign_id,
+                "recipient_email": request.recipient_email,
+                "data": result
+            })
+    except httpx.HTTPStatusError as e:
+        error_detail = f"Instantly API error: {e.response.status_code}"
+        try:
+            error_body = e.response.json()
+            error_detail = f"{error_detail} - {error_body}"
+        except:
+            error_detail = f"{error_detail} - {e.response.text}"
+        logger.error(f"HTTP error launching campaign: {error_detail}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=error_detail
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error launching campaign: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to launch campaign: {str(e)}"
+        )
+
+
+@app.post("/create-and-launch")
+async def create_and_launch(request: CreateAndLaunchRequest):
+    """
+    Create a campaign and immediately launch it with a recipient.
+    
+    This is a convenience endpoint that combines create-campaign and launch-campaign
+    into a single operation.
+    """
+    # Create campaign first
+    create_request = CreateCampaignRequest(
+        name=request.name,
+        email_account=request.email_account,
+        subject=request.subject,
+        custom_message=request.custom_message,
+        recipient_name=request.recipient_name
+    )
+    
+    create_response = await create_campaign(create_request)
+    create_data = json.loads(create_response.body.decode()) if hasattr(create_response, 'body') else {}
+    
+    # Extract campaign_id from result
+    campaign_id = create_data.get("campaign_id")
+    
+    if not campaign_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to get campaign ID after creation"
+        )
+    
+    # Launch campaign
+    launch_request = LaunchCampaignRequest(
+        campaign_id=campaign_id,
+        recipient_email=request.recipient_email,
+        recipient_name=request.recipient_name
+    )
+    
+    launch_response = await launch_campaign(launch_request)
+    launch_data = json.loads(launch_response.body.decode()) if hasattr(launch_response, 'body') else {}
+    
+    return JSONResponse(content={
+        "status": "success",
+        "message": "Campaign created and launched successfully",
+        "campaign_id": campaign_id,
+        "campaign_name": request.name,
+        "recipient_email": request.recipient_email,
+        "create_response": create_data,
+        "launch_response": launch_data
+    })
 
 
 @app.get("/health")
