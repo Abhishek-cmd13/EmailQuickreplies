@@ -151,16 +151,51 @@ async def receive(
     if not subject:
         raise HTTPException(status_code=400, detail="Subject is required")
     
+    # Personalized responses for each button choice
+    responses = {
+        "pay_this_month": {
+            "title": "Great! Let's Process Your Payment",
+            "message": "Thank you for choosing to pay this month! We appreciate your prompt action. Our team will send you payment instructions within 24 hours. You'll receive a secure payment link that you can use to complete your transaction easily.",
+            "next_steps": "Please keep an eye on your email for payment instructions."
+        },
+        "pay_next_month": {
+            "title": "Payment Scheduled for Next Month",
+            "message": "We've noted that you'd like to pay next month. No problem! We'll send you a reminder a few days before the due date to help you stay on track. If you'd like to set up a payment plan, we can assist with that as well.",
+            "next_steps": "You'll receive a payment reminder before next month's due date."
+        },
+        "never_pay": {
+            "title": "We Understand Your Concern",
+            "message": "We understand that you may be facing financial difficulties. Our team wants to work with you to find a solution that works for both parties. Let's explore options like payment plans, settlement agreements, or other arrangements that might be feasible for your situation.",
+            "next_steps": "A member of our team will reach out to discuss your options."
+        },
+        "connect_human": {
+            "title": "Connecting You with Our Team",
+            "message": "We want to make sure you get the personal attention you deserve! One of our team members will contact you directly within 24 hours to discuss your account and answer any questions you may have. They'll be able to provide personalized assistance and find the best solution for your situation.",
+            "next_steps": "Expect a call or email from our team within 24 hours."
+        }
+    }
+    
+    # Get the personalized response for the chosen option
+    response = responses.get(chosen, {
+        "title": "Thank You",
+        "message": "We've received your response.",
+        "next_steps": "We'll be in touch soon."
+    })
+    
     # Remaining options = ALL – selected
     remaining = [x for x in ALL if x != chosen]
     
     # Last step → end the loop
     if len(remaining) == 0:
         html = (
-            "<html><body style='font-family:Arial,sans-serif;padding:20px;'>"
-            "<h2>Thank you for your response!</h2>"
-            "<p>Your selection has been recorded. We'll be in touch soon.</p>"
-            "</body></html>"
+            "<html><body style='font-family:Arial,sans-serif;padding:30px;background-color:#f4f4f4;'>"
+            "<div style='background-color:white;padding:30px;border-radius:8px;max-width:600px;margin:0 auto;'>"
+            f"<h2 style='color:#4a3aff;'>{response['title']}</h2>"
+            f"<p style='font-size:16px;line-height:1.6;'>{response['message']}</p>"
+            f"<p style='font-size:14px;color:#666;margin-top:20px;'><strong>Next Steps:</strong> {response['next_steps']}</p>"
+            "<p style='margin-top:30px;padding-top:20px;border-top:1px solid #eee;color:#999;font-size:14px;'>"
+            "Your selection has been recorded. We'll be in touch soon!</p>"
+            "</div></body></html>"
         )
         await send_reply(uuid, subject, html)
         return "Flow complete ✔"
@@ -169,11 +204,15 @@ async def receive(
     buttons_html = "".join(create_button(o, uuid, subject) for o in remaining)
     
     html = (
-        "<html><body style='font-family:Arial,sans-serif;padding:20px;'>"
-        "<h2>Thanks for your response!</h2>"
-        "<p>Please choose one more option:</p>"
+        "<html><body style='font-family:Arial,sans-serif;padding:30px;background-color:#f4f4f4;'>"
+        "<div style='background-color:white;padding:30px;border-radius:8px;max-width:600px;margin:0 auto;'>"
+        f"<h2 style='color:#4a3aff;'>{response['title']}</h2>"
+        f"<p style='font-size:16px;line-height:1.6;'>{response['message']}</p>"
+        f"<p style='font-size:14px;color:#666;margin-top:20px;'><strong>Next Steps:</strong> {response['next_steps']}</p>"
+        "<hr style='border:none;border-top:1px solid #eee;margin:30px 0;'>"
+        "<p style='font-weight:bold;margin-bottom:15px;'>Please also let us know about your preference for:</p>"
         f"<div style='margin-top:20px;'>{buttons_html}</div>"
-        "</body></html>"
+        "</div></body></html>"
     )
     
     await send_reply(uuid, subject, html)
