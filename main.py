@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException, Body
+from fastapi import FastAPI, Query, HTTPException, Body, Request, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
 import httpx
@@ -169,9 +169,9 @@ async def root():
 
 @app.get("/r", response_class=HTMLResponse)
 async def receive(
-    chosen: str = Query(..., description="The selected quick reply option"),
-    uuid: str = Query(..., description="The email UUID from Instantly (original email UUID)"),
-    subject: str = Query(..., description="The email subject")
+    chosen: Optional[str] = Query(None, description="The selected quick reply option"),
+    uuid: Optional[str] = Query(None, alias="uuid", description="The email UUID from Instantly"),
+    subject: Optional[str] = Query(None, alias="subject", description="The email subject")
 ):
     """
     Handle quick reply selections from email clicks.
@@ -181,21 +181,109 @@ async def receive(
     
     IMPORTANT: All replies use the original UUID to maintain email threading.
     """
-    logger.info(f"Received quick reply: chosen={chosen}, uuid={uuid}, subject={subject}")
+    # Log the full request URL for debugging  
+    logger.info(f"Received quick reply request: chosen={chosen}, uuid={uuid}, subject={subject}")
+    
+    # Handle missing parameters - provide helpful error message
+    if not chosen and not uuid and not subject:
+        return HTMLResponse(content="""
+        <html>
+        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
+            <h2>⚠️ Missing Parameters</h2>
+            <p>All required parameters are missing from the request URL.</p>
+            <p><strong>This usually means:</strong></p>
+            <ul>
+                <li>Instantly.ai template variables weren't replaced</li>
+                <li>The email link format is incorrect</li>
+                <li>The link was clicked from a forwarded email</li>
+            </ul>
+            <p><strong>Solution:</strong> Check your Instantly.ai email template uses:</p>
+            <ul>
+                <li><code>{{email_id}}</code> for UUID</li>
+                <li><code>{{subject}}</code> for subject</li>
+            </ul>
+            <p>Make sure the URL format is: <code>/r?uuid={{email_id}}&subject={{subject}}&chosen=pay_this_month</code></p>
+        </body>
+        </html>
+        """)
+    
+    # Check if Instantly.ai variables weren't replaced (still contain {{ }})
+    if uuid and ("{{" in str(uuid) or "}}" in str(uuid)):
+        logger.warning(f"UUID contains unprocessed template variables: {uuid}")
+        return HTMLResponse(content="""
+        <html>
+        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
+            <h2>⚠️ Template Variable Error</h2>
+            <p>The email template variables were not properly replaced by Instantly.ai.</p>
+            <p><strong>Problem:</strong> The <code>{{email_id}}</code> variable wasn't replaced.</p>
+            <p><strong>Solution:</strong> Make sure your Instantly.ai email template uses:</p>
+            <ul>
+                <li><code>{{email_id}}</code> - for the email UUID (not {{email_uuid}} or other variations)</li>
+                <li><code>{{subject}}</code> - for the email subject</li>
+            </ul>
+            <p>Check your Instantly.ai campaign email template configuration and ensure variables are enabled.</p>
+        </body>
+        </html>
+        """)
+    
+    if subject and ("{{" in str(subject) or "}}" in str(subject)):
+        logger.warning(f"Subject contains unprocessed template variables: {subject}")
     
     # Validate inputs
+    if not chosen:
+        return HTMLResponse(content="""
+        <html>
+        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
+            <h2>⚠️ Missing Parameter</h2>
+            <p>The 'chosen' parameter is missing from the request URL.</p>
+            <p><strong>This usually means:</strong></p>
+            <ul>
+                <li>The email link is malformed</li>
+                <li>The link was clicked from a forwarded email</li>
+                <li>The template variables weren't properly configured</li>
+            </ul>
+            <p>Please check your Instantly.ai email template and ensure all parameters are included in the URL.</p>
+        </body>
+        </html>
+        """)
+    
     if chosen not in ALL:
         logger.warning(f"Invalid choice received: {chosen}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid choice: {chosen}. Must be one of {ALL}"
-        )
+        return HTMLResponse(content=f"""
+        <html>
+        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
+            <h2>⚠️ Invalid Choice</h2>
+            <p>Invalid choice received: <code>{chosen}</code></p>
+            <p>Valid options are: {', '.join(ALL)}</p>
+        </body>
+        </html>
+        """, status_code=400)
     
-    if not uuid:
-        raise HTTPException(status_code=400, detail="UUID is required")
+    if not uuid or uuid == "{{email_id}}" or uuid == "":
+        return HTMLResponse(content="""
+        <html>
+        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
+            <h2>⚠️ Missing UUID</h2>
+            <p>The email UUID is missing or not properly set.</p>
+            <p><strong>This means:</strong> The <code>{{email_id}}</code> variable wasn't replaced by Instantly.ai.</p>
+            <p><strong>Solution:</strong></p>
+            <ol>
+                <li>Go to your Instantly.ai campaign</li>
+                <li>Check the email template uses <code>{{email_id}}</code> (not {{email_uuid}})</li>
+                <li>Make sure template variables are enabled in Instantly.ai</li>
+                <li>Re-save the template</li>
+            </ol>
+        </body>
+        </html>
+        """)
     
-    if not subject:
-        raise HTTPException(status_code=400, detail="Subject is required")
+    if not subject or subject == "{{subject}}" or subject == "":
+        # Use a default subject if missing
+        subject = "Quick Reply Response"
+        logger.warning("Subject missing, using default")
+    
+    # Normalize subject
+    original_subject = str(subject).strip()
     
     # Extract original subject (remove any "Re: " prefixes for consistent threading)
     # This ensures all replies have the same base subject for proper threading
@@ -466,28 +554,37 @@ async def create_campaign(request: CreateCampaignRequest):
     
     try:
         logger.info(f"Creating campaign: {request.name}")
+        logger.info(f"Using API key: {INSTANTLY_API[:10]}..." if INSTANTLY_API else "No API key")
+        logger.info(f"Email account: {email_account}")
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Create campaign via Instantly.ai API
+            # Try different possible endpoint formats and payload structures
+            # Option 1: Try /campaigns endpoint (plural)
+            payload = {
+                "name": request.name,
+                "email_account": email_account,
+                "steps": [
+                    {
+                        "step_number": 1,
+                        "subject": request.subject,
+                        "body": {
+                            "html": template
+                        },
+                        "wait_time": 0
+                    }
+                ]
+            }
+            
+            logger.info(f"Attempting campaign creation with payload keys: {list(payload.keys())}")
+            
+            # Try /api/v2/campaigns (plural, RESTful)
             response = await client.post(
-                "https://api.instantly.ai/api/v2/campaign/create",
+                "https://api.instantly.ai/api/v2/campaigns",
                 headers={
                     "Authorization": f"Bearer {INSTANTLY_API}",
                     "Content-Type": "application/json"
                 },
-                json={
-                    "campaign_name": request.name,
-                    "email_account": email_account,
-                    "steps": [
-                        {
-                            "step_number": 1,
-                            "subject": request.subject,
-                            "body": {
-                                "html": template
-                            },
-                            "wait_time": 0  # Send immediately
-                        }
-                    ]
-                }
+                json=payload
             )
             response.raise_for_status()
             result = response.json()
@@ -504,10 +601,18 @@ async def create_campaign(request: CreateCampaignRequest):
         error_detail = f"Instantly API error: {e.response.status_code}"
         try:
             error_body = e.response.json()
+            logger.error(f"Full error response: {error_body}")
             error_detail = f"{error_detail} - {error_body}"
         except:
-            error_detail = f"{error_detail} - {e.response.text}"
+            error_text = e.response.text
+            logger.error(f"Error response text: {error_text}")
+            error_detail = f"{error_detail} - {error_text}"
+        
+        # Log the request details for debugging
+        logger.error(f"Request URL: https://api.instantly.ai/api/v2/campaigns")
+        logger.error(f"Request payload keys: {list(payload.keys()) if 'payload' in locals() else 'N/A'}")
         logger.error(f"HTTP error creating campaign: {error_detail}")
+        
         raise HTTPException(
             status_code=e.response.status_code,
             detail=error_detail
@@ -583,37 +688,28 @@ async def launch_campaign(request: LaunchCampaignRequest):
 
 
 @app.post("/create-and-launch")
-async def create_and_launch(request: CreateAndLaunchRequest):
+async def create_and_launch(request: CreateAndLaunchRequest, campaign_id: Optional[str] = Body(None)):
     """
-    Create a campaign and immediately launch it with a recipient.
+    Launch an existing campaign with a recipient.
     
-    This is a convenience endpoint that combines create-campaign and launch-campaign
-    into a single operation.
+    NOTE: Campaign creation via API requires special permissions. 
+    Please create the campaign manually in Instantly.ai dashboard first, 
+    then use this endpoint to launch it by providing the campaign_id.
+    
+    Alternatively, set INSTANTLY_CAMPAIGN_ID environment variable to use a default campaign.
     """
-    # Create campaign first
-    create_request = CreateCampaignRequest(
-        name=request.name,
-        email_account=request.email_account,
-        subject=request.subject,
-        custom_message=request.custom_message,
-        recipient_name=request.recipient_name
-    )
+    # Use provided campaign_id or environment variable
+    final_campaign_id = campaign_id or os.getenv("INSTANTLY_CAMPAIGN_ID")
     
-    create_response = await create_campaign(create_request)
-    create_data = json.loads(create_response.body.decode()) if hasattr(create_response, 'body') else {}
-    
-    # Extract campaign_id from result
-    campaign_id = create_data.get("campaign_id")
-    
-    if not campaign_id:
+    if not final_campaign_id:
         raise HTTPException(
-            status_code=500,
-            detail="Failed to get campaign ID after creation"
+            status_code=400,
+            detail="Campaign ID is required. Either provide 'campaign_id' in request body or set INSTANTLY_CAMPAIGN_ID environment variable. Note: You need to create the campaign manually in Instantly.ai dashboard first."
         )
     
-    # Launch campaign
+    # Launch campaign by adding lead
     launch_request = LaunchCampaignRequest(
-        campaign_id=campaign_id,
+        campaign_id=final_campaign_id,
         recipient_email=request.recipient_email,
         recipient_name=request.recipient_name
     )
@@ -623,11 +719,10 @@ async def create_and_launch(request: CreateAndLaunchRequest):
     
     return JSONResponse(content={
         "status": "success",
-        "message": "Campaign created and launched successfully",
-        "campaign_id": campaign_id,
-        "campaign_name": request.name,
+        "message": "Campaign launched successfully",
+        "campaign_id": final_campaign_id,
         "recipient_email": request.recipient_email,
-        "create_response": create_data,
+        "recipient_name": request.recipient_name,
         "launch_response": launch_data
     })
 
