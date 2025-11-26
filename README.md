@@ -136,6 +136,12 @@ curl "http://localhost:8000/r?uuid=test123&subject=Test&chosen=pay_this_month"
 - The flow completes when all options are exhausted
 - All email replies are sent through Instantly.ai API
 
+## API Documentation
+
+This project uses **Instantly.ai API v2**. For detailed API documentation:
+- [Official Instantly.ai API v2 Docs](https://developer.instantly.ai/)
+- [API Reference Guide](./INSTANTLY_API_REFERENCE.md) - Summary of relevant API endpoints
+
 ## License
 
 MIT

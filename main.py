@@ -2,8 +2,17 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import HTMLResponse
 import httpx
 import os
+import logging
 from typing import Optional
 from dotenv import load_dotenv
+from urllib.parse import quote
+
+# Configure logging
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file if it exists
 load_dotenv()
@@ -33,16 +42,21 @@ app = FastAPI(
 async def send_reply(uuid: str, subject: str, html: str) -> bool:
     """Send a reply email via Instantly API"""
     if not INSTANTLY_API or not SENDER:
+        logger.error("Instantly API credentials not configured")
         raise HTTPException(
             status_code=500,
             detail="Instantly API credentials not configured"
         )
     
     try:
+        logger.info(f"Sending reply for UUID: {uuid}, Subject: {subject}")
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 "https://api.instantly.ai/api/v2/emails/reply",
-                headers={"Authorization": f"Bearer {INSTANTLY_API}"},
+                headers={
+                    "Authorization": f"Bearer {INSTANTLY_API}",
+                    "Content-Type": "application/json"
+                },
                 json={
                     "reply_to_uuid": uuid,
                     "eaccount": SENDER,
@@ -51,13 +65,28 @@ async def send_reply(uuid: str, subject: str, html: str) -> bool:
                 }
             )
             response.raise_for_status()
+            logger.info(f"Successfully sent reply for UUID: {uuid}")
             return True
     except httpx.HTTPStatusError as e:
+        error_detail = f"Instantly API error: {e.response.status_code}"
+        try:
+            error_body = e.response.json()
+            error_detail = f"{error_detail} - {error_body}"
+        except:
+            error_detail = f"{error_detail} - {e.response.text}"
+        logger.error(f"HTTP error sending reply: {error_detail}")
         raise HTTPException(
             status_code=e.response.status_code,
-            detail=f"Instantly API error: {e.response.text}"
+            detail=error_detail
+        )
+    except httpx.TimeoutException:
+        logger.error(f"Timeout sending reply for UUID: {uuid}")
+        raise HTTPException(
+            status_code=504,
+            detail="Instantly API request timed out"
         )
     except Exception as e:
+        logger.error(f"Unexpected error sending reply: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to send reply: {str(e)}"
@@ -66,7 +95,9 @@ async def send_reply(uuid: str, subject: str, html: str) -> bool:
 
 def create_button(option: str, uuid: str, subject: str) -> str:
     """Create an HTML button link for a quick reply option"""
-    url = f"{BACKEND}/r?uuid={uuid}&subject={subject}&chosen={option}"
+    # URL encode the subject to handle special characters properly
+    encoded_subject = quote(subject, safe='')
+    url = f"{BACKEND}/r?uuid={uuid}&subject={encoded_subject}&chosen={option}"
     label = LABELS.get(option, option)
     return (
         f'<a href="{url}" '
@@ -104,8 +135,11 @@ async def receive(
     This endpoint processes user selections and sends follow-up emails
     with remaining options until all options are exhausted.
     """
+    logger.info(f"Received quick reply: chosen={chosen}, uuid={uuid}, subject={subject}")
+    
     # Validate inputs
     if chosen not in ALL:
+        logger.warning(f"Invalid choice received: {chosen}")
         raise HTTPException(
             status_code=400,
             detail=f"Invalid choice: {chosen}. Must be one of {ALL}"
