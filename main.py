@@ -40,7 +40,7 @@ app = FastAPI(
 
 
 async def send_reply(uuid: str, subject: str, html: str) -> bool:
-    """Send a reply email via Instantly API"""
+    """Send a reply email via Instantly API - ensures all replies stay in same thread"""
     if not INSTANTLY_API or not SENDER:
         logger.error("Instantly API credentials not configured")
         raise HTTPException(
@@ -48,8 +48,18 @@ async def send_reply(uuid: str, subject: str, html: str) -> bool:
             detail="Instantly API credentials not configured"
         )
     
+    # Normalize subject to ensure consistent threading
+    # Remove any existing "Re: " prefixes to avoid "Re: Re: Re: " chains
+    normalized_subject = subject.strip()
+    if normalized_subject.lower().startswith("re: "):
+        # Already has Re: prefix, use as is
+        reply_subject = normalized_subject
+    else:
+        # Add Re: prefix
+        reply_subject = f"Re: {normalized_subject}"
+    
     try:
-        logger.info(f"Sending reply for UUID: {uuid}, Subject: {subject}")
+        logger.info(f"Sending reply for UUID: {uuid}, Subject: {reply_subject}")
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 "https://api.instantly.ai/api/v2/emails/reply",
@@ -58,9 +68,9 @@ async def send_reply(uuid: str, subject: str, html: str) -> bool:
                     "Content-Type": "application/json"
                 },
                 json={
-                    "reply_to_uuid": uuid,
+                    "reply_to_uuid": uuid,  # Always reply to original UUID for threading
                     "eaccount": SENDER,
-                    "subject": f"Re: {subject}",
+                    "subject": reply_subject,  # Consistent subject for threading
                     "body": {"html": html}
                 }
             )
@@ -126,7 +136,7 @@ async def root():
 @app.get("/r", response_class=HTMLResponse)
 async def receive(
     chosen: str = Query(..., description="The selected quick reply option"),
-    uuid: str = Query(..., description="The email UUID from Instantly"),
+    uuid: str = Query(..., description="The email UUID from Instantly (original email UUID)"),
     subject: str = Query(..., description="The email subject")
 ):
     """
@@ -134,6 +144,8 @@ async def receive(
     
     This endpoint processes user selections and sends follow-up emails
     with remaining options until all options are exhausted.
+    
+    IMPORTANT: All replies use the original UUID to maintain email threading.
     """
     logger.info(f"Received quick reply: chosen={chosen}, uuid={uuid}, subject={subject}")
     
@@ -150,6 +162,12 @@ async def receive(
     
     if not subject:
         raise HTTPException(status_code=400, detail="Subject is required")
+    
+    # Extract original subject (remove any "Re: " prefixes for consistent threading)
+    # This ensures all replies have the same base subject for proper threading
+    original_subject = subject.strip()
+    while original_subject.lower().startswith("re: "):
+        original_subject = original_subject[4:].strip()
     
     # Personalized responses for each button choice
     responses = {
@@ -197,11 +215,13 @@ async def receive(
             "Your selection has been recorded. We'll be in touch soon!</p>"
             "</div></body></html>"
         )
-        await send_reply(uuid, subject, html)
+        # Always use original UUID and subject for threading
+        await send_reply(uuid, original_subject, html)
         return "Flow complete ✔"
     
     # Build next email dynamically with remaining options
-    buttons_html = "".join(create_button(o, uuid, subject) for o in remaining)
+    # Pass original_subject to maintain threading
+    buttons_html = "".join(create_button(o, uuid, original_subject) for o in remaining)
     
     html = (
         "<html><body style='font-family:Arial,sans-serif;padding:30px;background-color:#f4f4f4;'>"
@@ -215,7 +235,8 @@ async def receive(
         "</div></body></html>"
     )
     
-    await send_reply(uuid, subject, html)
+    # Always use original UUID and subject for threading
+    await send_reply(uuid, original_subject, html)
     return "Next email sent ✔"
 
 
