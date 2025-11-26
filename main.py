@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Query, HTTPException, Body
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, EmailStr
 import httpx
 import os
 import logging
@@ -31,6 +32,15 @@ LABELS = {
 }
 
 ALL = list(LABELS.keys())
+
+# Pydantic models for request validation
+class SendEmailRequest(BaseModel):
+    recipient_email: EmailStr
+    subject: str
+    recipient_name: Optional[str] = None
+    custom_message: Optional[str] = None
+    campaign_id: Optional[str] = None
+
 
 app = FastAPI(
     title="Email Quick Reply System",
@@ -240,6 +250,169 @@ async def receive(
     return "Next email sent ✔"
 
 
+def create_email_template(recipient_name: str = "there", custom_message: Optional[str] = None) -> str:
+    """Create the email template with quick reply buttons"""
+    greeting = f"Hello {recipient_name}" if recipient_name and recipient_name != "there" else "Hello there"
+    message = custom_message or "Thank you for your recent communication. We want to make it easy for you to respond and help you find the best solution."
+    
+    # Button colors mapping
+    button_colors = {
+        "pay_this_month": "#10b981",
+        "pay_next_month": "#f59e0b",
+        "never_pay": "#ef4444",
+        "connect_human": "#6366f1"
+    }
+    
+    buttons_html = ""
+    for key, label in LABELS.items():
+        color = button_colors.get(key, "#4a3aff")
+        buttons_html += f'''<a href="{BACKEND}/r?uuid={{email_id}}&subject={{subject}}&chosen={key}" 
+               style="display:block;padding:15px 20px;background:{color};color:white;border-radius:6px;margin:12px 0;text-decoration:none;font-family:Arial,sans-serif;font-size:16px;text-align:center;box-sizing:border-box;font-weight:bold;">
+               {label}
+            </a>'''
+    
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f4f4f4;">
+    
+    <div style="background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+        
+        <h2 style="color: #4a3aff; margin-top: 0;">{greeting},</h2>
+        
+        <p>{message}</p>
+        
+        <p style="font-weight: bold; color: #333;">Please select your preferred option below:</p>
+        
+        <div style="margin: 30px 0;">
+            {buttons_html}
+        </div>
+        
+        <p style="color: #666; font-size: 14px; margin-top: 30px;">
+            Your response will help us assist you better. Thank you for your time!
+        </p>
+        
+        <p style="color: #666; font-size: 14px; margin-top: 20px;">
+            Best regards,<br>
+            <strong>Your Team</strong>
+        </p>
+        
+    </div>
+    
+    <div style="text-align: center; margin-top: 20px; color: #999; font-size: 12px;">
+        <p>This is an automated email. Please use the buttons above to respond.</p>
+    </div>
+    
+</body>
+</html>
+"""
+
+
+async def send_email_via_instantly(recipient_email: str, subject: str, html_content: str, campaign_id: str, recipient_name: Optional[str] = None) -> dict:
+    """Send email via Instantly.ai by adding lead to campaign"""
+    if not INSTANTLY_API or not SENDER:
+        raise HTTPException(
+            status_code=500,
+            detail="Instantly API credentials not configured"
+        )
+    
+    if not campaign_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Campaign ID is required"
+        )
+    
+    try:
+        logger.info(f"Sending email to {recipient_email} via campaign {campaign_id}")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Add lead to campaign - Instantly.ai will automatically send the campaign email
+            response = await client.post(
+                "https://api.instantly.ai/api/v2/leads/add",
+                headers={
+                    "Authorization": f"Bearer {INSTANTLY_API}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "campaign_id": campaign_id,
+                    "leads": [{
+                        "email": recipient_email,
+                        "first_name": recipient_name or "Customer"
+                    }]
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            logger.info(f"Successfully added lead to campaign: {result}")
+            return {
+                "status": "success",
+                "message": "Lead added to campaign. Email will be sent according to campaign schedule.",
+                "recipient_email": recipient_email,
+                "campaign_id": campaign_id
+            }
+    except httpx.HTTPStatusError as e:
+        error_detail = f"Instantly API error: {e.response.status_code}"
+        try:
+            error_body = e.response.json()
+            error_detail = f"{error_detail} - {error_body}"
+        except:
+            error_detail = f"{error_detail} - {e.response.text}"
+        logger.error(f"HTTP error sending email: {error_detail}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=error_detail
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error sending email: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send email: {str(e)}"
+        )
+
+
+@app.post("/send-email")
+async def send_email(request: SendEmailRequest):
+    """
+    Send an email with quick reply buttons to a recipient.
+    
+    This endpoint adds a lead to an Instantly.ai campaign, which will automatically
+    send the email according to the campaign configuration.
+    
+    Note: You need to set INSTANTLY_CAMPAIGN_ID environment variable or provide campaign_id.
+    The campaign should have the email template configured with quick reply buttons.
+    """
+    logger.info(f"Send email request received for: {request.recipient_email}")
+    
+    # Create email template (for reference - actual sending via campaign)
+    template = create_email_template(
+        recipient_name=request.recipient_name or "there",
+        custom_message=request.custom_message
+    )
+    
+    # Use provided campaign_id or environment variable
+    campaign_id = request.campaign_id or os.getenv("INSTANTLY_CAMPAIGN_ID")
+    
+    if not campaign_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Campaign ID is required. Set INSTANTLY_CAMPAIGN_ID environment variable or provide campaign_id in request."
+        )
+    
+    # Send email via Instantly.ai campaign
+    result = await send_email_via_instantly(
+        recipient_email=request.recipient_email,
+        subject=request.subject,
+        html_content=template,
+        campaign_id=campaign_id,
+        recipient_name=request.recipient_name
+    )
+    
+    return JSONResponse(content=result)
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint"""
@@ -247,6 +420,7 @@ async def health():
         "status": "healthy",
         "api_configured": bool(INSTANTLY_API),
         "sender_configured": bool(SENDER),
-        "backend_configured": bool(BACKEND)
+        "backend_configured": bool(BACKEND),
+        "campaign_configured": bool(os.getenv("INSTANTLY_CAMPAIGN_ID"))
     }
 
