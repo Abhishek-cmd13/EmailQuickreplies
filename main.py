@@ -73,15 +73,20 @@ app = FastAPI()
 async def instantly_webhook(req: Request):
     try:
         payload = await req.json()
-    except:
+    except Exception as e:
         body = await req.body()
-        log(f"❌ invalid_json body={body.decode('utf-8', errors='ignore')[:200]}")
-        return {"error":"invalid_json"}
+        body_str = body.decode('utf-8', errors='ignore')[:200] if body else "(empty)"
+        log(f"❌ invalid_json error={str(e)} body={body_str}")
+        return JSONResponse({"error":"invalid_json"}, status_code=400)
+    
+    if not payload:
+        log(f"❌ empty_payload")
+        return JSONResponse({"error":"empty_payload"}, status_code=400)
     
     log(f"📥 webhook {payload}")
     
     # ---- Validate campaign ----
-    cid = payload.get("campaign_id") or payload.get("campaign_uuid")
+    cid = payload.get("campaign_id") or payload.get("campaign_uuid") or payload.get("campaign")
     if cid!=ALLOWED_CAMPAIGN_ID: 
         return {"ignored":"wrong_campaign"}
     
@@ -90,9 +95,9 @@ async def instantly_webhook(req: Request):
     if "click" not in event.lower(): 
         return {"ignored":"not_click"}
     
-    uuid    = payload.get("email_id") or payload.get("email_uuid")
+    uuid    = payload.get("email_id") or payload.get("email_uuid") or payload.get("id")
     link    = payload.get("link") or payload.get("url") or payload.get("clicked_url")
-    subject = payload.get("subject") or "Loan status"
+    subject = payload.get("subject") or payload.get("email_subject") or "Loan status"
     
     if not uuid or not link:
         log(f"❌ missing_data uuid={uuid} link={link}")
@@ -102,8 +107,8 @@ async def instantly_webhook(req: Request):
     from urllib.parse import urlparse, parse_qs
     try:
         choice = parse_qs(urlparse(link).query).get("c",[None])[0]
-    except:
-        log(f"❌ parse_error link={link}")
+    except Exception as e:
+        log(f"❌ parse_error link={link} error={str(e)}")
         return {"error":"parse_error"}
     
     if not choice or choice not in ALL:
