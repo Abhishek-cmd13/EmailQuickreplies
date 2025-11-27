@@ -1,740 +1,749 @@
-from fastapi import FastAPI, Query, HTTPException, Body, Request, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, EmailStr
-import httpx
 import os
-import json
 import logging
-from typing import Optional
+import json
+import asyncio
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+from collections import deque
+
+import httpx
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from dotenv import load_dotenv
-from urllib.parse import quote
 
-# Configure logging
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# Load environment variables from .env file if it exists
+# Load environment variables from .env file
 load_dotenv()
 
-# Environment variables
-INSTANTLY_API = os.getenv("INSTANTLY_API_KEY")
-SENDER = os.getenv("INSTANTLY_EACCOUNT")  # ex → collections@riverline.ai
-BACKEND = os.getenv("BACKEND_URL")  # ex → https://reply.riverline.ai
+# ─────────────────────────────
+# ENV
+# ─────────────────────────────
+INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY")
+INSTANTLY_EACCOUNT = os.getenv("INSTANTLY_EACCOUNT")  # e.g. collections@riverline.ai
+FRONTEND_ACTION_BASE = os.getenv(
+    "FRONTEND_ACTION_BASE",
+    "https://riverline.ai/qr"  # just needs to be a URL Instantly can track
+)
 
-# Quick reply labels
-LABELS = {
-    "pay_this_month": "💚 I want to pay this month",
-    "pay_next_month": "🟡 I want to pay next month",
-    "never_pay": "🔴 I'll never pay this loan",
-    "connect_human": "👥 Connect me to a human"
+# Campaign ID restriction - only process events from this campaign
+ALLOWED_CAMPAIGN_ID = "e205ce46-f772-42fd-a81c-40eaa996f54e"
+
+if not INSTANTLY_API_KEY or not INSTANTLY_EACCOUNT:
+    raise RuntimeError("Set INSTANTLY_API_KEY and INSTANTLY_EACCOUNT in env")
+
+INSTANTLY_BASE_URL = "https://api.instantly.ai/api/v2"
+
+# ─────────────────────────────
+# LOGGING
+# ─────────────────────────────
+# Log buffer to store recent log entries
+LOG_BUFFER = deque(maxlen=1000)  # Keep last 1000 log entries
+
+class LogBufferHandler(logging.Handler):
+    """Custom logging handler that stores logs in a buffer"""
+    def emit(self, record):
+        try:
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "level": record.levelname,
+                "message": self.format(record)
+            }
+            LOG_BUFFER.append(log_entry)
+        except Exception:
+            pass  # Don't fail if logging fails
+
+# Setup logging
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True  # Force reconfiguration
+)
+log = logging.getLogger("webhook-reply-backend")
+
+# Add buffer handler to capture logs
+buffer_handler = LogBufferHandler()
+buffer_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+buffer_handler.setLevel(logging.DEBUG)  # Capture all log levels
+
+# Add to our logger
+log.addHandler(buffer_handler)
+log.setLevel(logging.DEBUG)
+
+# Add to root logger to catch all logs from any module
+root_logger = logging.getLogger()
+root_logger.addHandler(buffer_handler)
+root_logger.setLevel(logging.DEBUG)
+
+# Test that logging is working
+log.info("=" * 80)
+log.info("🔴 LOG BUFFER INITIALIZED - All logs will be captured")
+log.info("=" * 80)
+
+# ─────────────────────────────
+# OPTIONS / LABELS
+# ─────────────────────────────
+CHOICE_LABELS: Dict[str, str] = {
+    "close_loan": "🔵 Close my loan",
+    "settle_loan": "💠 Settle my loan",
+    "never_pay": "⚠️ I will never pay this loan",
+    "need_more_time": "⏳ I need more time",
 }
 
-ALL = list(LABELS.keys())
+ALL_CHOICES: List[str] = list(CHOICE_LABELS.keys())
 
-# Pydantic models for request validation
-class SendEmailRequest(BaseModel):
-    recipient_email: EmailStr
-    subject: str
-    recipient_name: Optional[str] = None
-    custom_message: Optional[str] = None
-    campaign_id: Optional[str] = None
-
-
-class CreateCampaignRequest(BaseModel):
-    name: str
-    email_account: Optional[str] = None  # Will use SENDER if not provided
-    subject: str
-    custom_message: Optional[str] = None
-    recipient_name: Optional[str] = None
-
-
-class LaunchCampaignRequest(BaseModel):
-    campaign_id: str
-    recipient_email: EmailStr
-    recipient_name: Optional[str] = None
+# Optional: choice → explanation + next-steps text
+CHOICE_COPY: Dict[str, Dict[str, str]] = {
+    "close_loan": {
+        "title": "You'd like to close your loan",
+        "body": "Thanks for letting us know you want to close your loan. We'll share closure steps and final amount shortly.",
+    },
+    "settle_loan": {
+        "title": "You're exploring a settlement",
+        "body": "Thanks for choosing settlement. We'll evaluate your account and share a settlement proposal.",
+    },
+    "never_pay": {
+        "title": "You're unable / unwilling to pay",
+        "body": "We understand circumstances can be difficult. We'll review your case and see what support or options are possible.",
+    },
+    "need_more_time": {
+        "title": "You need more time",
+        "body": "We've noted that you need more time. We'll get back with flexible date/options to help you.",
+    },
+}
 
 
-class CreateAndLaunchRequest(BaseModel):
-    name: str
-    subject: str
-    recipient_email: EmailStr
-    email_account: Optional[str] = None
-    custom_message: Optional[str] = None
-    recipient_name: Optional[str] = None
-
-
+# ─────────────────────────────
+# APP
+# ─────────────────────────────
 app = FastAPI(
-    title="Email Quick Reply System",
-    description="Quick reply system for Instantly.ai email automation",
-    version="1.0.0"
+    title="Riverline – Instantly Webhook Reply Backend",
+    version="1.0.0",
 )
 
 
-async def send_reply(uuid: str, subject: str, html: str) -> bool:
-    """Send a reply email via Instantly API - ensures all replies stay in same thread"""
-    if not INSTANTLY_API or not SENDER:
-        logger.error("Instantly API credentials not configured")
-        raise HTTPException(
-            status_code=500,
-            detail="Instantly API credentials not configured"
-        )
-    
-    # Normalize subject to ensure consistent threading
-    # Remove any existing "Re: " prefixes to avoid "Re: Re: Re: " chains
-    normalized_subject = subject.strip()
-    if normalized_subject.lower().startswith("re: "):
-        # Already has Re: prefix, use as is
-        reply_subject = normalized_subject
-    else:
-        # Add Re: prefix
-        reply_subject = f"Re: {normalized_subject}"
-    
+# ─────────────────────────────
+# Helpers
+# ─────────────────────────────
+
+def extract_choice_from_link(link: str) -> Optional[str]:
+    """
+    We expect links like:
+      https://riverline.ai/qr?c=close_loan
+      https://riverline.ai/qr?choice=settle_loan
+
+    We only care about query param c/choice.
+    """
+    from urllib.parse import urlparse, parse_qs
+
     try:
-        logger.info(f"Sending reply for UUID: {uuid}, Subject: {reply_subject}")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.instantly.ai/api/v2/emails/reply",
-                headers={
-                    "Authorization": f"Bearer {INSTANTLY_API}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "reply_to_uuid": uuid,  # Always reply to original UUID for threading
-                    "eaccount": SENDER,
-                    "subject": reply_subject,  # Consistent subject for threading
-                    "body": {"html": html}
-                }
-            )
-            response.raise_for_status()
-            logger.info(f"Successfully sent reply for UUID: {uuid}")
-            return True
-    except httpx.HTTPStatusError as e:
-        error_detail = f"Instantly API error: {e.response.status_code}"
-        try:
-            error_body = e.response.json()
-            error_detail = f"{error_detail} - {error_body}"
-        except:
-            error_detail = f"{error_detail} - {e.response.text}"
-        logger.error(f"HTTP error sending reply: {error_detail}")
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=error_detail
-        )
-    except httpx.TimeoutException:
-        logger.error(f"Timeout sending reply for UUID: {uuid}")
-        raise HTTPException(
-            status_code=504,
-            detail="Instantly API request timed out"
-        )
+        parsed = urlparse(link)
+        qs = parse_qs(parsed.query)
+        choice = qs.get("c") or qs.get("choice")
+        if choice:
+            return choice[0]
     except Exception as e:
-        logger.error(f"Unexpected error sending reply: {str(e)}")
+        log.warning(f"Failed to parse choice from link={link}: {e}")
+    return None
+
+
+async def send_reply_same_thread(
+    email_uuid: str,
+    subject: Optional[str],
+    html_body: str,
+) -> Dict[str, Any]:
+    """
+    Use Instantly reply API to send a threaded email.
+
+    reply_to_uuid: email_id from webhook → keeps it in same thread.
+    """
+    # Normalise subject
+    subj = subject or "Update about your loan"
+    subj = subj.strip()
+    if not subj.lower().startswith("re:"):
+        subj = f"Re: {subj}"
+
+    payload = {
+        "reply_to_uuid": email_uuid,
+        "eaccount": INSTANTLY_EACCOUNT,
+        "subject": subj,
+        "body": {"html": html_body},
+    }
+
+    headers = {
+        "Authorization": f"Bearer {INSTANTLY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    log.info(f"Sending reply via Instantly: email_uuid={email_uuid}, subject={subj}")
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            f"{INSTANTLY_BASE_URL}/emails/reply", json=payload, headers=headers
+        )
+
+    if resp.status_code >= 400:
+        log.error(f"Instantly reply error {resp.status_code}: {resp.text}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to send reply: {str(e)}"
+            detail=f"Instantly reply failed: {resp.status_code}",
         )
 
+    return resp.json()
 
-def create_button(option: str, uuid: str, subject: str) -> str:
-    """Create an HTML button link for a quick reply option"""
-    # URL encode the subject to handle special characters properly
-    encoded_subject = quote(subject, safe='')
-    url = f"{BACKEND}/r?uuid={uuid}&subject={encoded_subject}&chosen={option}"
-    label = LABELS.get(option, option)
+
+def build_buttons_html(remaining_choices: List[str]) -> str:
+    """
+    Only purpose of URLs is: Instantly will track click and call our webhook again.
+
+    We DO NOT need to host GET pages at FRONTEND_ACTION_BASE.
+    If you want, you can serve a simple 'Thanks' page separately.
+    """
+    if not remaining_choices:
+        return ""
+
+    button_style = (
+        "display:block;"
+        "margin:8px 0;"
+        "padding:10px 14px;"
+        "background:#4a3aff;"
+        "color:#ffffff;"
+        "text-decoration:none;"
+        "border-radius:6px;"
+        "font-family:system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;"
+        "font-size:14px;"
+        "text-align:center;"
+    )
+
+    parts = []
+    for key in remaining_choices:
+        label = CHOICE_LABELS.get(key, key)
+        url = f"{FRONTEND_ACTION_BASE}?c={key}"
+        parts.append(f'<a href="{url}" style="{button_style}">{label}</a>')
+
+    return "<br>".join(parts)
+
+
+def build_email_html(chosen: str, remaining: List[str]) -> str:
+    copy = CHOICE_COPY.get(
+        chosen,
+        {
+            "title": "Thank you for your response",
+            "body": "We've recorded your selection.",
+        },
+    )
+
+    buttons_html = build_buttons_html(remaining)
+
+    extra_block = ""
+    if remaining:
+        extra_block = f"""
+        <p style="font-weight:600; margin-top:24px;">
+            To help us understand better, please choose one more option:
+        </p>
+        <div>{buttons_html}</div>
+        """
+
+    html = f"""
+    <html>
+      <body style="font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.6;color:#111827;background:#f9fafb;padding:24px;">
+        <div style="max-width:600px;margin:0 auto;background:white;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+          <h2 style="color:#4a3aff;margin-top:0;margin-bottom:12px;">{copy['title']}</h2>
+          <p style="margin:0 0 18px 0;">{copy['body']}</p>
+
+          {extra_block if remaining else ""}
+
+          {"<p style='font-size:12px;color:#6b7280;margin-top:24px;'>We'll be in touch shortly with next steps.</p>" if not remaining else ""}
+
+          <p style="font-size:12px;color:#9ca3af;margin-top:24px;border-top:1px solid #e5e7eb;padding-top:12px;">
+            This is an automated email. You can reply to this email if anything is unclear.
+          </p>
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
+
+def detect_event_type(payload: Dict[str, Any]) -> str:
+    """
+    Try to infer event type from various keys.
+    Instantly may send: "event", "type", "event_type", etc.
+    """
     return (
-        f'<a href="{url}" '
-        f'style="display:inline-block;padding:12px 20px;background:#4a3aff;'
-        f'color:white;border-radius:6px;margin:8px;text-decoration:none;'
-        f'font-family:Arial,sans-serif;font-size:14px;">{label}</a><br>'
+        payload.get("event")
+        or payload.get("type")
+        or payload.get("event_type")
+        or ""
     )
 
 
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    """Health check endpoint"""
-    backend_display = BACKEND or "YOUR_BACKEND_URL"
-    return f"""
+def get_email_uuid(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Try to extract the email UUID used by Instantly for replies.
+    """
+    return (
+        payload.get("email_id")
+        or payload.get("email_uuid")
+        or payload.get("id")
+        or payload.get("emailId")
+    )
+
+
+def get_clicked_link(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Try to extract the clicked URL from various possible fields.
+    """
+    return (
+        payload.get("link")
+        or payload.get("url")
+        or payload.get("clicked_url")
+        or payload.get("clickedLink")
+    )
+
+
+def get_campaign_id(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Try to extract the campaign ID from various possible fields.
+    """
+    return (
+        payload.get("campaign_id")
+        or payload.get("campaignId")
+        or payload.get("campaign_uuid")
+        or payload.get("campaign")
+    )
+
+
+# ─────────────────────────────
+# Middleware to log ALL incoming requests
+# ─────────────────────────────
+@app.middleware("http")
+async def log_all_requests(request: Request, call_next):
+    """Log ALL incoming requests to catch webhooks that might not match our endpoint"""
+    from datetime import datetime
+    start_time = datetime.now()
+    
+    # Log every request - especially important for webhooks
+    log.info("=" * 80)
+    log.info(f"🌐 INCOMING REQUEST: {request.method} {request.url.path}")
+    log.info(f"   Full URL: {request.url}")
+    log.info(f"   Client: {request.client.host if request.client else 'unknown'}")
+    log.info(f"   User-Agent: {request.headers.get('user-agent', 'N/A')}")
+    
+    # For POST/PUT requests to webhook endpoints, log that we're receiving it
+    if request.method in ["POST", "PUT"] and "/webhook" in request.url.path:
+        log.info(f"   ⚠️  WEBHOOK-LIKE REQUEST DETECTED")
+        log.info(f"   Content-Type: {request.headers.get('content-type', 'N/A')}")
+        log.info(f"   Content-Length: {request.headers.get('content-length', 'N/A')}")
+    
+    log.info("=" * 80)
+    
+    try:
+        response = await call_next(request)
+        process_time = (datetime.now() - start_time).total_seconds()
+        log.info(f"✅ REQUEST COMPLETED: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.3f}s")
+        return response
+    except Exception as e:
+        log.error(f"❌ REQUEST ERROR: {request.method} {request.url.path} - {str(e)}")
+        import traceback
+        log.error(traceback.format_exc())
+        raise
+
+
+# ─────────────────────────────
+# Routes
+# ─────────────────────────────
+
+@app.get("/health")
+async def health():
+    log.info("Health check endpoint accessed")
+    return {
+        "status": "ok",
+        "instantly_configured": bool(INSTANTLY_API_KEY and INSTANTLY_EACCOUNT),
+        "frontend_action_base": FRONTEND_ACTION_BASE,
+        "allowed_campaign_id": ALLOWED_CAMPAIGN_ID,
+        "log_buffer_size": len(LOG_BUFFER),
+    }
+
+
+@app.get("/logs", response_class=HTMLResponse)
+async def view_logs():
+    """HTML page to view logs with auto-refresh"""
+    return """
+    <!DOCTYPE html>
     <html>
-        <head><title>Email Quick Reply System</title></head>
-        <body style="font-family:Arial,sans-serif;padding:40px;max-width:800px;margin:0 auto;">
-            <h1>Email Quick Reply System</h1>
-            <p>System is running! ✅</p>
-            <p>Configure your Instantly campaign to use: <code>{backend_display}/r</code></p>
-        </body>
+    <head>
+        <title>Live Logs - Webhook Backend</title>
+        <style>
+            body {
+                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                margin: 0;
+                padding: 20px;
+            }
+            h1 {
+                color: #4a9eff;
+                border-bottom: 2px solid #4a9eff;
+                padding-bottom: 10px;
+            }
+            #log-container {
+                background: #252526;
+                border: 1px solid #3e3e42;
+                border-radius: 4px;
+                padding: 15px;
+                max-height: 80vh;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                font-size: 13px;
+                line-height: 1.5;
+            }
+            .log-entry {
+                margin: 2px 0;
+                padding: 2px 0;
+            }
+            .log-info { color: #4a9eff; }
+            .log-warning { color: #ffa500; }
+            .log-error { color: #f48771; }
+            .log-success { color: #89d185; }
+            .controls {
+                margin: 15px 0;
+                display: flex;
+                gap: 10px;
+                align-items: center;
+            }
+            button {
+                background: #4a9eff;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+            }
+            button:hover { background: #3a8eef; }
+            button:disabled { background: #555; cursor: not-allowed; }
+            #status {
+                color: #89d185;
+                font-weight: bold;
+            }
+            .timestamp { color: #858585; }
+        </style>
+    </head>
+    <body>
+        <h1>📋 Live Logs Viewer</h1>
+        <div class="controls">
+            <button id="refreshBtn" onclick="refreshLogs()">🔄 Refresh</button>
+            <button id="clearBtn" onclick="clearLogs()">🗑️ Clear</button>
+            <button id="autoRefreshBtn" onclick="toggleAutoRefresh()">⏸️ Auto-refresh</button>
+            <button onclick="fetch('/test/webhook', {method: 'POST'}).then(() => refreshLogs())">🧪 Test Webhook</button>
+            <span id="status">● Live</span>
+            <span style="color: #858585;">| Last updated: <span id="lastUpdate">-</span></span>
+        </div>
+        <div id="log-container"></div>
+        <script>
+            let autoRefreshInterval = null;
+            let isAutoRefreshing = false;
+
+            function formatLog(logEntry) {
+                const level = logEntry.level.toLowerCase();
+                const timestamp = logEntry.timestamp ? new Date(logEntry.timestamp).toLocaleTimeString() : '';
+                const levelClass = `log-${level}`;
+                return `<div class="log-entry ${levelClass}"><span class="timestamp">[${timestamp}]</span> ${escapeHtml(logEntry.message)}</div>`;
+            }
+
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            async function refreshLogs() {
+                try {
+                    // Filter out debug messages about log endpoint access
+                    const response = await fetch('/logs/json?limit=500&filter_debug=true');
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    const logs = await response.json();
+                    const container = document.getElementById('log-container');
+                    
+                    if (!Array.isArray(logs)) {
+                        container.innerHTML = '<div style="color: #f48771;">Error: Invalid response format</div>';
+                        return;
+                    }
+                    
+                    if (logs.length === 0) {
+                        container.innerHTML = '<div style="color: #858585;">No logs yet. Logs will appear here when webhooks are received.<br>Try triggering a webhook or click the test button below.</div>';
+                        return;
+                    }
+                    
+                    container.innerHTML = logs.map(formatLog).join('');
+                    container.scrollTop = container.scrollHeight;
+                    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                } catch (error) {
+                    console.error('Error fetching logs:', error);
+                    const container = document.getElementById('log-container');
+                    container.innerHTML = `<div style="color: #f48771;">Error loading logs: ${error.message}</div>`;
+                }
+            }
+
+            function clearLogs() {
+                fetch('/logs/clear', { method: 'POST' });
+                document.getElementById('log-container').innerHTML = '';
+            }
+
+            function toggleAutoRefresh() {
+                const btn = document.getElementById('autoRefreshBtn');
+                if (isAutoRefreshing) {
+                    clearInterval(autoRefreshInterval);
+                    btn.textContent = '▶️ Auto-refresh';
+                    btn.style.background = '#4a9eff';
+                    isAutoRefreshing = false;
+                    document.getElementById('status').textContent = '● Paused';
+                } else {
+                    autoRefreshInterval = setInterval(refreshLogs, 1000);
+                    btn.textContent = '⏸️ Auto-refresh';
+                    btn.style.background = '#89d185';
+                    isAutoRefreshing = true;
+                    document.getElementById('status').textContent = '● Live';
+                }
+            }
+
+            // Initial load and start auto-refresh
+            refreshLogs();
+            toggleAutoRefresh();
+        </script>
+    </body>
     </html>
     """
 
 
-@app.get("/r", response_class=HTMLResponse)
-async def receive(
-    chosen: Optional[str] = Query(None, description="The selected quick reply option"),
-    uuid: Optional[str] = Query(None, alias="uuid", description="The email UUID from Instantly"),
-    subject: Optional[str] = Query(None, alias="subject", description="The email subject")
-):
-    """
-    Handle quick reply selections from email clicks.
+@app.get("/logs/json")
+async def get_logs_json(limit: int = 500, filter_debug: bool = True):
+    """Get logs as JSON"""
+    # Don't log debug messages for logs endpoint access to avoid clutter
+    logs = list(LOG_BUFFER)
+    if limit:
+        logs = logs[-limit:]
     
-    This endpoint processes user selections and sends follow-up emails
-    with remaining options until all options are exhausted.
+    # Filter out debug messages about log endpoint access if requested
+    if filter_debug:
+        logs = [log_entry for log_entry in logs if "Logs endpoint accessed" not in log_entry.get("message", "")]
     
-    IMPORTANT: All replies use the original UUID to maintain email threading.
-    """
-    # Log the full request URL for debugging  
-    logger.info(f"Received quick reply request: chosen={chosen}, uuid={uuid}, subject={subject}")
-    
-    # Handle missing parameters - provide helpful error message
-    if not chosen and not uuid and not subject:
-        return HTMLResponse(content="""
-        <html>
-        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
-            <h2>⚠️ Missing Parameters</h2>
-            <p>All required parameters are missing from the request URL.</p>
-            <p><strong>This usually means:</strong></p>
-            <ul>
-                <li>Instantly.ai template variables weren't replaced</li>
-                <li>The email link format is incorrect</li>
-                <li>The link was clicked from a forwarded email</li>
-            </ul>
-            <p><strong>Solution:</strong> Check your Instantly.ai email template uses:</p>
-            <ul>
-                <li><code>{{email_id}}</code> for UUID</li>
-                <li><code>{{subject}}</code> for subject</li>
-            </ul>
-            <p>Make sure the URL format is: <code>/r?uuid={{email_id}}&subject={{subject}}&chosen=pay_this_month</code></p>
-        </body>
-        </html>
-        """)
-    
-    # Check if Instantly.ai variables weren't replaced (still contain {{ }})
-    if uuid and ("{{" in str(uuid) or "}}" in str(uuid)):
-        logger.warning(f"UUID contains unprocessed template variables: {uuid}")
-        return HTMLResponse(content="""
-        <html>
-        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
-            <h2>⚠️ Template Variable Error</h2>
-            <p>The email template variables were not properly replaced by Instantly.ai.</p>
-            <p><strong>Problem:</strong> The <code>{{email_id}}</code> variable wasn't replaced.</p>
-            <p><strong>Solution:</strong> Make sure your Instantly.ai email template uses:</p>
-            <ul>
-                <li><code>{{email_id}}</code> - for the email UUID (not {{email_uuid}} or other variations)</li>
-                <li><code>{{subject}}</code> - for the email subject</li>
-            </ul>
-            <p>Check your Instantly.ai campaign email template configuration and ensure variables are enabled.</p>
-        </body>
-        </html>
-        """)
-    
-    if subject and ("{{" in str(subject) or "}}" in str(subject)):
-        logger.warning(f"Subject contains unprocessed template variables: {subject}")
-    
-    # Validate inputs
-    if not chosen:
-        return HTMLResponse(content="""
-        <html>
-        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
-            <h2>⚠️ Missing Parameter</h2>
-            <p>The 'chosen' parameter is missing from the request URL.</p>
-            <p><strong>This usually means:</strong></p>
-            <ul>
-                <li>The email link is malformed</li>
-                <li>The link was clicked from a forwarded email</li>
-                <li>The template variables weren't properly configured</li>
-            </ul>
-            <p>Please check your Instantly.ai email template and ensure all parameters are included in the URL.</p>
-        </body>
-        </html>
-        """)
-    
-    if chosen not in ALL:
-        logger.warning(f"Invalid choice received: {chosen}")
-        return HTMLResponse(content=f"""
-        <html>
-        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
-            <h2>⚠️ Invalid Choice</h2>
-            <p>Invalid choice received: <code>{chosen}</code></p>
-            <p>Valid options are: {', '.join(ALL)}</p>
-        </body>
-        </html>
-        """, status_code=400)
-    
-    if not uuid or uuid == "{{email_id}}" or uuid == "":
-        return HTMLResponse(content="""
-        <html>
-        <body style="font-family:Arial,sans-serif;padding:40px;max-width:600px;margin:0 auto;">
-            <h2>⚠️ Missing UUID</h2>
-            <p>The email UUID is missing or not properly set.</p>
-            <p><strong>This means:</strong> The <code>{{email_id}}</code> variable wasn't replaced by Instantly.ai.</p>
-            <p><strong>Solution:</strong></p>
-            <ol>
-                <li>Go to your Instantly.ai campaign</li>
-                <li>Check the email template uses <code>{{email_id}}</code> (not {{email_uuid}})</li>
-                <li>Make sure template variables are enabled in Instantly.ai</li>
-                <li>Re-save the template</li>
-            </ol>
-        </body>
-        </html>
-        """)
-    
-    if not subject or subject == "{{subject}}" or subject == "":
-        # Use a default subject if missing
-        subject = "Quick Reply Response"
-        logger.warning("Subject missing, using default")
-    
-    # Normalize subject
-    original_subject = str(subject).strip()
-    
-    # Extract original subject (remove any "Re: " prefixes for consistent threading)
-    # This ensures all replies have the same base subject for proper threading
-    original_subject = subject.strip()
-    while original_subject.lower().startswith("re: "):
-        original_subject = original_subject[4:].strip()
-    
-    # Personalized responses for each button choice
-    responses = {
-        "pay_this_month": {
-            "title": "Great! Let's Process Your Payment",
-            "message": "Thank you for choosing to pay this month! We appreciate your prompt action. Our team will send you payment instructions within 24 hours. You'll receive a secure payment link that you can use to complete your transaction easily.",
-            "next_steps": "Please keep an eye on your email for payment instructions."
-        },
-        "pay_next_month": {
-            "title": "Payment Scheduled for Next Month",
-            "message": "We've noted that you'd like to pay next month. No problem! We'll send you a reminder a few days before the due date to help you stay on track. If you'd like to set up a payment plan, we can assist with that as well.",
-            "next_steps": "You'll receive a payment reminder before next month's due date."
-        },
-        "never_pay": {
-            "title": "We Understand Your Concern",
-            "message": "We understand that you may be facing financial difficulties. Our team wants to work with you to find a solution that works for both parties. Let's explore options like payment plans, settlement agreements, or other arrangements that might be feasible for your situation.",
-            "next_steps": "A member of our team will reach out to discuss your options."
-        },
-        "connect_human": {
-            "title": "Connecting You with Our Team",
-            "message": "We want to make sure you get the personal attention you deserve! One of our team members will contact you directly within 24 hours to discuss your account and answer any questions you may have. They'll be able to provide personalized assistance and find the best solution for your situation.",
-            "next_steps": "Expect a call or email from our team within 24 hours."
-        }
-    }
-    
-    # Get the personalized response for the chosen option
-    response = responses.get(chosen, {
-        "title": "Thank You",
-        "message": "We've received your response.",
-        "next_steps": "We'll be in touch soon."
-    })
-    
-    # Remaining options = ALL – selected
-    remaining = [x for x in ALL if x != chosen]
-    
-    # Last step → end the loop
-    if len(remaining) == 0:
-        html = (
-            "<html><body style='font-family:Arial,sans-serif;padding:30px;background-color:#f4f4f4;'>"
-            "<div style='background-color:white;padding:30px;border-radius:8px;max-width:600px;margin:0 auto;'>"
-            f"<h2 style='color:#4a3aff;'>{response['title']}</h2>"
-            f"<p style='font-size:16px;line-height:1.6;'>{response['message']}</p>"
-            f"<p style='font-size:14px;color:#666;margin-top:20px;'><strong>Next Steps:</strong> {response['next_steps']}</p>"
-            "<p style='margin-top:30px;padding-top:20px;border-top:1px solid #eee;color:#999;font-size:14px;'>"
-            "Your selection has been recorded. We'll be in touch soon!</p>"
-            "</div></body></html>"
-        )
-        # Always use original UUID and subject for threading
-        await send_reply(uuid, original_subject, html)
-        return "Flow complete ✔"
-    
-    # Build next email dynamically with remaining options
-    # Pass original_subject to maintain threading
-    buttons_html = "".join(create_button(o, uuid, original_subject) for o in remaining)
-    
-    html = (
-        "<html><body style='font-family:Arial,sans-serif;padding:30px;background-color:#f4f4f4;'>"
-        "<div style='background-color:white;padding:30px;border-radius:8px;max-width:600px;margin:0 auto;'>"
-        f"<h2 style='color:#4a3aff;'>{response['title']}</h2>"
-        f"<p style='font-size:16px;line-height:1.6;'>{response['message']}</p>"
-        f"<p style='font-size:14px;color:#666;margin-top:20px;'><strong>Next Steps:</strong> {response['next_steps']}</p>"
-        "<hr style='border:none;border-top:1px solid #eee;margin:30px 0;'>"
-        "<p style='font-weight:bold;margin-bottom:15px;'>Please also let us know about your preference for:</p>"
-        f"<div style='margin-top:20px;'>{buttons_html}</div>"
-        "</div></body></html>"
-    )
-    
-    # Always use original UUID and subject for threading
-    await send_reply(uuid, original_subject, html)
-    return "Next email sent ✔"
+    return logs
 
 
-def create_email_template(recipient_name: str = "there", custom_message: Optional[str] = None) -> str:
-    """Create the email template with quick reply buttons"""
-    greeting = f"Hello {recipient_name}" if recipient_name and recipient_name != "there" else "Hello there"
-    message = custom_message or "Thank you for your recent communication. We want to make it easy for you to respond and help you find the best solution."
-    
-    # Button colors mapping
-    button_colors = {
-        "pay_this_month": "#10b981",
-        "pay_next_month": "#f59e0b",
-        "never_pay": "#ef4444",
-        "connect_human": "#6366f1"
-    }
-    
-    buttons_html = ""
-    for key, label in LABELS.items():
-        color = button_colors.get(key, "#4a3aff")
-        buttons_html += f'''<a href="{BACKEND}/r?uuid={{email_id}}&subject={{subject}}&chosen={key}" 
-               style="display:block;padding:15px 20px;background:{color};color:white;border-radius:6px;margin:12px 0;text-decoration:none;font-family:Arial,sans-serif;font-size:16px;text-align:center;box-sizing:border-box;font-weight:bold;">
-               {label}
-            </a>'''
-    
-    return f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f4f4f4;">
-    
-    <div style="background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-        
-        <h2 style="color: #4a3aff; margin-top: 0;">{greeting},</h2>
-        
-        <p>{message}</p>
-        
-        <p style="font-weight: bold; color: #333;">Please select your preferred option below:</p>
-        
-        <div style="margin: 30px 0;">
-            {buttons_html}
-        </div>
-        
-        <p style="color: #666; font-size: 14px; margin-top: 30px;">
-            Your response will help us assist you better. Thank you for your time!
-        </p>
-        
-        <p style="color: #666; font-size: 14px; margin-top: 20px;">
-            Best regards,<br>
-            <strong>Your Team</strong>
-        </p>
-        
-    </div>
-    
-    <div style="text-align: center; margin-top: 20px; color: #999; font-size: 12px;">
-        <p>This is an automated email. Please use the buttons above to respond.</p>
-    </div>
-    
-</body>
-</html>
-"""
+@app.post("/logs/clear")
+async def clear_logs():
+    """Clear the log buffer"""
+    LOG_BUFFER.clear()
+    log.info("Log buffer cleared by user")
+    return {"status": "ok", "message": "Log buffer cleared"}
 
 
-async def send_email_via_instantly(recipient_email: str, subject: str, html_content: str, campaign_id: str, recipient_name: Optional[str] = None) -> dict:
-    """Send email via Instantly.ai by adding lead to campaign"""
-    if not INSTANTLY_API or not SENDER:
-        raise HTTPException(
-            status_code=500,
-            detail="Instantly API credentials not configured"
-        )
-    
-    if not campaign_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Campaign ID is required"
-        )
-    
-    try:
-        logger.info(f"Sending email to {recipient_email} via campaign {campaign_id}")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Add lead to campaign - Instantly.ai will automatically send the campaign email
-            response = await client.post(
-                "https://api.instantly.ai/api/v2/leads/add",
-                headers={
-                    "Authorization": f"Bearer {INSTANTLY_API}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "campaign_id": campaign_id,
-                    "leads": [{
-                        "email": recipient_email,
-                        "first_name": recipient_name or "Customer"
-                    }]
-                }
-            )
-            response.raise_for_status()
-            result = response.json()
-            logger.info(f"Successfully added lead to campaign: {result}")
-            return {
-                "status": "success",
-                "message": "Lead added to campaign. Email will be sent according to campaign schedule.",
-                "recipient_email": recipient_email,
-                "campaign_id": campaign_id
-            }
-    except httpx.HTTPStatusError as e:
-        error_detail = f"Instantly API error: {e.response.status_code}"
-        try:
-            error_body = e.response.json()
-            error_detail = f"{error_detail} - {error_body}"
-        except:
-            error_detail = f"{error_detail} - {e.response.text}"
-        logger.error(f"HTTP error sending email: {error_detail}")
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=error_detail
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error sending email: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to send email: {str(e)}"
-        )
-
-
-@app.post("/send-email")
-async def send_email(request: SendEmailRequest):
-    """
-    Send an email with quick reply buttons to a recipient.
-    
-    This endpoint adds a lead to an Instantly.ai campaign, which will automatically
-    send the email according to the campaign configuration.
-    
-    Note: You need to set INSTANTLY_CAMPAIGN_ID environment variable or provide campaign_id.
-    The campaign should have the email template configured with quick reply buttons.
-    """
-    logger.info(f"Send email request received for: {request.recipient_email}")
-    
-    # Create email template (for reference - actual sending via campaign)
-    template = create_email_template(
-        recipient_name=request.recipient_name or "there",
-        custom_message=request.custom_message
-    )
-    
-    # Use provided campaign_id or environment variable
-    campaign_id = request.campaign_id or os.getenv("INSTANTLY_CAMPAIGN_ID")
-    
-    if not campaign_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Campaign ID is required. Set INSTANTLY_CAMPAIGN_ID environment variable or provide campaign_id in request."
-        )
-    
-    # Send email via Instantly.ai campaign
-    result = await send_email_via_instantly(
-        recipient_email=request.recipient_email,
-        subject=request.subject,
-        html_content=template,
-        campaign_id=campaign_id,
-        recipient_name=request.recipient_name
-    )
-    
-    return JSONResponse(content=result)
-
-
-@app.post("/create-campaign")
-async def create_campaign(request: CreateCampaignRequest):
-    """
-    Create a new Instantly.ai campaign with quick reply email template.
-    
-    This endpoint creates a campaign with an email template that includes
-    the quick reply buttons. After creation, you can launch it using /launch-campaign.
-    """
-    if not INSTANTLY_API:
-        raise HTTPException(
-            status_code=500,
-            detail="Instantly API credentials not configured"
-        )
-    
-    email_account = request.email_account or SENDER
-    if not email_account:
-        raise HTTPException(
-            status_code=400,
-            detail="Email account is required. Set INSTANTLY_EACCOUNT or provide email_account in request."
-        )
-    
-    # Create email template
-    template = create_email_template(
-        recipient_name=request.recipient_name or "there",
-        custom_message=request.custom_message
-    )
-    
-    try:
-        logger.info(f"Creating campaign: {request.name}")
-        logger.info(f"Using API key: {INSTANTLY_API[:10]}..." if INSTANTLY_API else "No API key")
-        logger.info(f"Email account: {email_account}")
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Try different possible endpoint formats and payload structures
-            # Option 1: Try /campaigns endpoint (plural)
-            payload = {
-                "name": request.name,
-                "email_account": email_account,
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "subject": request.subject,
-                        "body": {
-                            "html": template
-                        },
-                        "wait_time": 0
-                    }
-                ]
-            }
-            
-            logger.info(f"Attempting campaign creation with payload keys: {list(payload.keys())}")
-            
-            # Try /api/v2/campaigns (plural, RESTful)
-            response = await client.post(
-                "https://api.instantly.ai/api/v2/campaigns",
-                headers={
-                    "Authorization": f"Bearer {INSTANTLY_API}",
-                    "Content-Type": "application/json"
-                },
-                json=payload
-            )
-            response.raise_for_status()
-            result = response.json()
-            logger.info(f"Campaign created successfully: {result}")
-            campaign_id = result.get("campaign_id") or result.get("id") or result.get("data", {}).get("campaign_id")
-            return JSONResponse(content={
-                "status": "success",
-                "message": "Campaign created successfully",
-                "campaign_id": campaign_id,
-                "campaign_name": request.name,
-                "data": result
-            })
-    except httpx.HTTPStatusError as e:
-        error_detail = f"Instantly API error: {e.response.status_code}"
-        try:
-            error_body = e.response.json()
-            logger.error(f"Full error response: {error_body}")
-            error_detail = f"{error_detail} - {error_body}"
-        except:
-            error_text = e.response.text
-            logger.error(f"Error response text: {error_text}")
-            error_detail = f"{error_detail} - {error_text}"
-        
-        # Log the request details for debugging
-        logger.error(f"Request URL: https://api.instantly.ai/api/v2/campaigns")
-        logger.error(f"Request payload keys: {list(payload.keys()) if 'payload' in locals() else 'N/A'}")
-        logger.error(f"HTTP error creating campaign: {error_detail}")
-        
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=error_detail
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error creating campaign: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to create campaign: {str(e)}"
-        )
-
-
-@app.post("/launch-campaign")
-async def launch_campaign(request: LaunchCampaignRequest):
-    """
-    Launch a campaign by adding a lead to it.
-    
-    This adds a recipient to an existing campaign, which will trigger
-    the campaign to send emails according to its schedule.
-    """
-    if not INSTANTLY_API:
-        raise HTTPException(
-            status_code=500,
-            detail="Instantly API credentials not configured"
-        )
-    
-    try:
-        logger.info(f"Launching campaign {request.campaign_id} for {request.recipient_email}")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Add lead to campaign
-            response = await client.post(
-                "https://api.instantly.ai/api/v2/leads/add",
-                headers={
-                    "Authorization": f"Bearer {INSTANTLY_API}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "campaign_id": request.campaign_id,
-                    "leads": [{
-                        "email": request.recipient_email,
-                        "first_name": request.recipient_name or "Customer"
-                    }]
-                }
-            )
-            response.raise_for_status()
-            result = response.json()
-            logger.info(f"Campaign launched successfully: {result}")
-            return JSONResponse(content={
-                "status": "success",
-                "message": "Campaign launched. Email will be sent according to campaign schedule.",
-                "campaign_id": request.campaign_id,
-                "recipient_email": request.recipient_email,
-                "data": result
-            })
-    except httpx.HTTPStatusError as e:
-        error_detail = f"Instantly API error: {e.response.status_code}"
-        try:
-            error_body = e.response.json()
-            error_detail = f"{error_detail} - {error_body}"
-        except:
-            error_detail = f"{error_detail} - {e.response.text}"
-        logger.error(f"HTTP error launching campaign: {error_detail}")
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=error_detail
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error launching campaign: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to launch campaign: {str(e)}"
-        )
-
-
-@app.post("/create-and-launch")
-async def create_and_launch(request: CreateAndLaunchRequest, campaign_id: Optional[str] = Body(None)):
-    """
-    Launch an existing campaign with a recipient.
-    
-    NOTE: Campaign creation via API requires special permissions. 
-    Please create the campaign manually in Instantly.ai dashboard first, 
-    then use this endpoint to launch it by providing the campaign_id.
-    
-    Alternatively, set INSTANTLY_CAMPAIGN_ID environment variable to use a default campaign.
-    """
-    # Use provided campaign_id or environment variable
-    final_campaign_id = campaign_id or os.getenv("INSTANTLY_CAMPAIGN_ID")
-    
-    if not final_campaign_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Campaign ID is required. Either provide 'campaign_id' in request body or set INSTANTLY_CAMPAIGN_ID environment variable. Note: You need to create the campaign manually in Instantly.ai dashboard first."
-        )
-    
-    # Launch campaign by adding lead
-    launch_request = LaunchCampaignRequest(
-        campaign_id=final_campaign_id,
-        recipient_email=request.recipient_email,
-        recipient_name=request.recipient_name
-    )
-    
-    launch_response = await launch_campaign(launch_request)
-    launch_data = json.loads(launch_response.body.decode()) if hasattr(launch_response, 'body') else {}
-    
-    return JSONResponse(content={
-        "status": "success",
-        "message": "Campaign launched successfully",
-        "campaign_id": final_campaign_id,
-        "recipient_email": request.recipient_email,
-        "recipient_name": request.recipient_name,
-        "launch_response": launch_data
-    })
-
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
+@app.post("/test/webhook")
+async def test_webhook():
+    """Test endpoint to simulate a webhook and generate logs"""
+    log.info("=" * 80)
+    log.info("🧪 TEST WEBHOOK TRIGGERED")
+    log.info("=" * 80)
+    log.info("This is a test webhook to verify logging is working")
+    log.info("When real webhooks come in, you'll see similar logs")
+    log.info("=" * 80)
     return {
-        "status": "healthy",
-        "api_configured": bool(INSTANTLY_API),
-        "sender_configured": bool(SENDER),
-        "backend_configured": bool(BACKEND),
-        "campaign_configured": bool(os.getenv("INSTANTLY_CAMPAIGN_ID"))
+        "status": "ok",
+        "message": "Test webhook logged. Check /logs to see the entries.",
+        "log_buffer_size": len(LOG_BUFFER)
     }
+
+
+@app.api_route("/webhook/instantly", methods=["POST", "GET", "PUT", "DELETE"])
+@app.api_route("/webhook/instantly/", methods=["POST", "GET", "PUT", "DELETE"])
+@app.api_route("/webhook", methods=["POST", "GET", "PUT", "DELETE"])
+async def instantly_webhook(request: Request):
+    """
+    Main webhook endpoint.
+
+    Configure in Instantly dashboard:
+      URL: https://your-backend.onrender.com/webhook/instantly
+      Events: CLICK (and optionally SENT/OPEN for future use)
+
+    Expected (approx) click payload:
+    {
+      "event": "click",
+      "email_id": "uuid-here",
+      "recipient": "user@example.com",
+      "link": "https://riverline.ai/qr?c=close_loan",
+      "subject": "Loan update",
+      "campaign_id": "e205ce46-f772-42fd-a81c-40eaa996f54e",
+      ...
+    }
+    """
+    import json
+    from datetime import datetime
+    
+    # CRITICAL: Log ALL webhooks FIRST, before any validation
+    # This ensures we capture everything, even invalid requests
+    
+    # Get raw body for logging
+    try:
+        body = await request.body()
+    except Exception as e:
+        body = b""
+        log.error(f"Failed to read request body: {e}")
+    
+    # Log complete incoming request - THIS HAPPENS FOR ALL WEBHOOKS
+    log.info("=" * 80)
+    log.info(f"📥 INCOMING WEBHOOK REQUEST - {datetime.now().isoformat()}")
+    log.info("=" * 80)
+    log.info(f"Headers: {dict(request.headers)}")
+    log.info(f"Method: {request.method}")
+    log.info(f"URL: {request.url}")
+    log.info(f"Client: {request.client.host if request.client else 'unknown'}")
+    log.info("-" * 80)
+    log.info("RAW BODY:")
+    try:
+        body_json = json.loads(body) if body else {}
+        log.info(json.dumps(body_json, indent=2))
+    except Exception as e:
+        log.warning(f"Failed to parse body as JSON: {e}")
+        log.info(body.decode('utf-8', errors='ignore') if body else "(empty body)")
+    log.info("=" * 80)
+
+    # Parse payload - handle errors gracefully
+    try:
+        # If we already parsed it, use that, otherwise parse again
+        if 'body_json' in locals():
+            payload = body_json
+        else:
+            payload = await request.json()
+        
+        # Log parsed payload
+        log.info("PARSED PAYLOAD:")
+        log.info(json.dumps(payload, indent=2))
+    except Exception as e:
+        log.error(f"Failed to parse request as JSON: {e}")
+        log.info("Proceeding with empty payload for validation")
+        payload = {}
+
+    # Validate campaign ID - only process events from allowed campaign
+    campaign_id = get_campaign_id(payload)
+    
+    log.info("-" * 80)
+    log.info("CAMPAIGN ID VALIDATION:")
+    log.info(f"  Received campaign_id: {campaign_id}")
+    log.info(f"  Allowed campaign_id: {ALLOWED_CAMPAIGN_ID}")
+    
+    if not campaign_id:
+        log.warning("❌ REJECTED: campaign_id missing from payload")
+        log.info("=" * 80)
+        log.info("✅ WEBHOOK LOGGED (rejected but logged for debugging)")
+        log.info("=" * 80)
+        return JSONResponse({
+            "status": "ignored",
+            "reason": "missing_campaign_id",
+            "allowed_campaign_id": ALLOWED_CAMPAIGN_ID,
+            "message": "Webhook must include campaign_id. This system is restricted to a single campaign."
+        })
+    
+    if campaign_id != ALLOWED_CAMPAIGN_ID:
+        log.warning(f"❌ REJECTED: campaign_id {campaign_id} does not match allowed campaign")
+        log.info("=" * 80)
+        log.info("✅ WEBHOOK LOGGED (rejected but logged for debugging)")
+        log.info("=" * 80)
+        return JSONResponse({
+            "status": "ignored",
+            "reason": "wrong_campaign_id",
+            "received_campaign_id": campaign_id,
+            "allowed_campaign_id": ALLOWED_CAMPAIGN_ID,
+            "message": f"This system only processes events from campaign {ALLOWED_CAMPAIGN_ID}"
+        })
+    
+    log.info(f"✅ Campaign ID validated: {campaign_id}")
+
+    event_type = detect_event_type(payload)
+    
+    log.info("-" * 80)
+    log.info("EVENT TYPE:")
+    log.info(f"  Detected event_type: {event_type}")
+    
+    if not event_type:
+        log.warning("❌ REJECTED: Webhook without event type")
+        log.info("=" * 80)
+        log.info("✅ WEBHOOK LOGGED (rejected but logged for debugging)")
+        log.info("=" * 80)
+        return JSONResponse({"status": "ignored", "reason": "no_event_type"})
+
+    # We only care about click events for this flow
+    if "click" not in event_type.lower():
+        log.info(f"⚠️  IGNORED: Event type '{event_type}' is not a click event")
+        log.info("=" * 80)
+        log.info("✅ WEBHOOK LOGGED (ignored but logged for debugging)")
+        log.info("=" * 80)
+        return JSONResponse({"status": "ignored", "event_type": event_type})
+    
+    log.info(f"✅ Processing click event")
+
+    email_uuid = get_email_uuid(payload)
+    clicked_link = get_clicked_link(payload)
+    subject = payload.get("subject") or payload.get("email_subject")
+
+    log.info("-" * 80)
+    log.info("EXTRACTED DATA:")
+    log.info(f"  email_uuid: {email_uuid}")
+    log.info(f"  clicked_link: {clicked_link}")
+    log.info(f"  subject: {subject}")
+
+    if not email_uuid:
+        log.error("❌ ERROR: Click webhook missing email_uuid")
+        log.info("=" * 80)
+        raise HTTPException(status_code=400, detail="Missing email_id/email_uuid in payload")
+
+    if not clicked_link:
+        log.error("❌ ERROR: Click webhook missing link/url")
+        log.info("=" * 80)
+        raise HTTPException(status_code=400, detail="Missing link/url in payload")
+
+    choice = extract_choice_from_link(clicked_link)
+    log.info(f"  Extracted choice: {choice}")
+    
+    if not choice:
+        log.warning(f"❌ REJECTED: Could not parse choice from link={clicked_link}")
+        log.info("=" * 80)
+        return JSONResponse({"status": "ignored", "reason": "no_choice_in_link"})
+
+    if choice not in ALL_CHOICES:
+        log.warning(f"❌ REJECTED: Unknown choice '{choice}', allowed={ALL_CHOICES}")
+        log.info("=" * 80)
+        return JSONResponse({"status": "ignored", "reason": f"unknown_choice_{choice}"})
+
+    log.info(f"✅ Valid choice: {choice}")
+
+    # Stateless forward logic: remaining = ALL - current choice
+    remaining = [c for c in ALL_CHOICES if c != choice]
+    log.info(f"  Remaining choices: {remaining}")
+    
+    log.info("-" * 80)
+    log.info("BUILDING REPLY EMAIL...")
+    html_body = build_email_html(choice, remaining)
+
+    log.info("-" * 80)
+    log.info("SENDING REPLY VIA INSTANTLY.AI...")
+    await send_reply_same_thread(email_uuid, subject, html_body)
+
+    log.info("=" * 80)
+    log.info("✅ WEBHOOK PROCESSED SUCCESSFULLY")
+    log.info(f"   Choice: {choice}")
+    log.info(f"   Email UUID: {email_uuid}")
+    log.info(f"   Remaining choices: {remaining}")
+    log.info("=" * 80)
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "handled_event": "click",
+            "choice": choice,
+            "remaining_choices": remaining,
+            "email_uuid": email_uuid,
+        }
+    )
 
