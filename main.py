@@ -187,34 +187,18 @@ async def send_reply_same_thread(
     return resp.json()
 
 
-def build_buttons_html(remaining_choices: List[str]) -> str:
+def build_links_html(remaining_choices: List[str]) -> str:
     """
-    Only purpose of URLs is: Instantly will track click and call our webhook again.
-
-    We DO NOT need to host GET pages at FRONTEND_ACTION_BASE.
-    If you want, you can serve a simple 'Thanks' page separately.
+    Build plain links (no styling) - Instantly will track clicks and call our webhook.
     """
     if not remaining_choices:
         return ""
-
-    button_style = (
-        "display:block;"
-        "margin:8px 0;"
-        "padding:10px 14px;"
-        "background:#4a3aff;"
-        "color:#ffffff;"
-        "text-decoration:none;"
-        "border-radius:6px;"
-        "font-family:system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;"
-        "font-size:14px;"
-        "text-align:center;"
-    )
 
     parts = []
     for key in remaining_choices:
         label = CHOICE_LABELS.get(key, key)
         url = f"{FRONTEND_ACTION_BASE}?c={key}"
-        parts.append(f'<a href="{url}" style="{button_style}">{label}</a>')
+        parts.append(f'<a href="{url}">{label}</a>')
 
     return "<br>".join(parts)
 
@@ -228,32 +212,26 @@ def build_email_html(chosen: str, remaining: List[str]) -> str:
         },
     )
 
-    buttons_html = build_buttons_html(remaining)
+    links_html = build_links_html(remaining)
 
     extra_block = ""
     if remaining:
         extra_block = f"""
-        <p style="font-weight:600; margin-top:24px;">
-            To help us understand better, please choose one more option:
-        </p>
-        <div>{buttons_html}</div>
+        <p>To help us understand better, please choose one more option:</p>
+        <p>{links_html}</p>
         """
 
     html = f"""
     <html>
-      <body style="font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.6;color:#111827;background:#f9fafb;padding:24px;">
-        <div style="max-width:600px;margin:0 auto;background:white;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-          <h2 style="color:#4a3aff;margin-top:0;margin-bottom:12px;">{copy['title']}</h2>
-          <p style="margin:0 0 18px 0;">{copy['body']}</p>
+      <body>
+        <h2>{copy['title']}</h2>
+        <p>{copy['body']}</p>
 
-          {extra_block if remaining else ""}
+        {extra_block if remaining else ""}
 
-          {"<p style='font-size:12px;color:#6b7280;margin-top:24px;'>We'll be in touch shortly with next steps.</p>" if not remaining else ""}
+        {"<p>We'll be in touch shortly with next steps.</p>" if not remaining else ""}
 
-          <p style="font-size:12px;color:#9ca3af;margin-top:24px;border-top:1px solid #e5e7eb;padding-top:12px;">
-            This is an automated email. You can reply to this email if anything is unclear.
-          </p>
-        </div>
+        <p>This is an automated email. You can reply to this email if anything is unclear.</p>
       </body>
     </html>
     """
