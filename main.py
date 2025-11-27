@@ -13,7 +13,7 @@ load_dotenv()
 # ───────── CONFIG ─────────
 INSTANTLY_API_KEY     = os.getenv("INSTANTLY_API_KEY")
 INSTANTLY_EACCOUNT    = os.getenv("INSTANTLY_EACCOUNT")
-FRONTEND_ACTION_BASE  = os.getenv("FRONTEND_ACTION_BASE", "https://riverline.ai/qr")
+FRONTEND_ACTION_BASE  = os.getenv("FRONTEND_ACTION_BASE", "https://riverline.credit/qr")
 ALLOWED_CAMPAIGN_ID   = "e205ce46-f772-42fd-a81c-40eaa996f54e"
 INSTANTLY_URL         = "https://api.instantly.ai/api/v2/emails/reply"
 
@@ -41,6 +41,32 @@ CHOICE_COPY = {
 LOGS = deque(maxlen=800)
 
 def log(x): LOGS.append({"t":datetime.now().isoformat(),"m":x}); print(x)
+
+# ───────── TEMP STORAGE FOR CLICKS (to match with webhooks) ─────────
+# Stores recent clicks: [(timestamp, choice, ip), ...]
+RECENT_CLICKS = deque(maxlen=100)
+
+async def find_email_id_for_lead(lead_email: str, campaign_id: str = None):
+    """Try to find email_id for a lead using Instantly.ai API"""
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            # Try to get campaign emails
+            url = "https://api.instantly.ai/api/v2/emails/list"
+            params = {"eaccount": INSTANTLY_EACCOUNT, "email": lead_email}
+            if campaign_id:
+                params["campaign_id"] = campaign_id
+            
+            r = await c.get(url, params=params, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
+            if r.status_code == 200:
+                data = r.json()
+                emails = data.get("emails", [])
+                if emails:
+                    # Get most recent email
+                    latest = sorted(emails, key=lambda x: x.get("sent_at", ""), reverse=True)[0]
+                    return latest.get("id") or latest.get("email_id")
+    except Exception as e:
+        log(f"⚠️ Could not fetch email_id: {str(e)}")
+    return None
 
 # ───────── BUILD EMAIL HTML ─────────
 def build_html(choice, remaining):
@@ -108,8 +134,6 @@ async def instantly_webhook(req: Request):
     step = payload.get("step") or "unknown"
     email_account = payload.get("email_account") or "unknown"
     
-    # Note: Instantly.ai doesn't include the clicked URL in the webhook payload
-    # The actual click goes to /qr endpoint which we log separately
     log(f"📥 WEBHOOK EVENT: {event_type}")
     log(f"   👤 Lead Email: {recipient}")
     log(f"   📧 Email Account: {email_account}")
@@ -117,22 +141,55 @@ async def instantly_webhook(req: Request):
     log(f"   🔢 Step: {step} | Workspace: {workspace}")
     log(f"📦 FULL_PAYLOAD: {json.dumps(payload, indent=2)}")
     
-    # Check if this is a click event
+    # Check if this is a click event - send automatic reply
     if "click" in event_type.lower():
         log(f"✅ LINK_CLICK_WEBHOOK_RECEIVED from Instantly.ai")
-        log(f"⚠️ NOTE: The clicked URL is not in webhook payload. Check /qr logs for which link was clicked.")
+        
+        # Find most recent click within last 60 seconds
+        now = datetime.now()
+        matching_click = None
+        for click_time, choice, ip in reversed(list(RECENT_CLICKS)):
+            time_diff = (now - click_time).total_seconds()
+            if time_diff < 60:  # Within last 60 seconds
+                matching_click = choice
+                log(f"📌 Matched with recent click: {choice} (from {time_diff:.1f}s ago)")
+                break
+        
+        if matching_click:
+            choice = matching_click
+            
+            # Try to get email_id from Instantly.ai API
+            email_id = await find_email_id_for_lead(recipient, campaign_id)
+            
+            if email_id:
+                # Get remaining choices
+                remaining = [c for c in ALL if c != choice]
+                html = build_html(choice, remaining)
+                await reply(email_id, "Loan Update", html)
+                log(f"✅ Reply sent for choice: {choice} to {recipient}")
+            else:
+                log(f"⚠️ Could not find email_id for {recipient}. Reply not sent.")
+        else:
+            log(f"⚠️ No recent click found (within 60s). Reply not sent.")
     
-    # No actions taken - just log and return success
     return {"ok":True}
 
 # ========== NO-PAGE CLICK ENDPOINT ==========
 @app.get("/qr")
-def qr_click(request: Request): 
+async def qr_click(request: Request): 
     # Log when someone clicks a link
     query_params = dict(request.query_params)
     choice = query_params.get("c") or query_params.get("choice") or "unknown"
-    log(f"🔗 LINK_CLICKED: /qr?c={choice} | Params: {query_params} | IP: {request.client.host if request.client else 'unknown'}")
-    log(f"⚠️ NOTE: This is a direct link click. Instantly.ai should send a webhook to /webhook/instantly for tracking.")
+    client_ip = request.client.host if request.client else "unknown"
+    
+    log(f"🔗 LINK_CLICKED: /qr?c={choice} | Params: {query_params} | IP: {client_ip}")
+    
+    # Store the click with timestamp - webhook will match within 60 seconds
+    if choice != "unknown":
+        RECENT_CLICKS.append((datetime.now(), choice, client_ip))
+        log(f"💾 Stored choice {choice} - waiting for webhook (will match within 60s)")
+    
+    log(f"ℹ️ Instantly.ai will send webhook → automatic reply will be sent")
     return PlainTextResponse("",status_code=204)  # invisible
 
 # ========== LOGS UI ==========
@@ -152,6 +209,7 @@ def status():
         "webhook_url": f"https://emailquickreplies.onrender.com/webhook/instantly",
         "campaign_id": ALLOWED_CAMPAIGN_ID,
         "frontend_action_base": FRONTEND_ACTION_BASE,
+        "domain": "riverline.credit",
         "logs_count": len(LOGS),
         "recent_events": list(LOGS)[-10:] if LOGS else []
     }
