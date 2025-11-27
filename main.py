@@ -89,28 +89,32 @@ async def instantly_webhook(req: Request):
     link    = payload.get("link") or payload.get("url") or payload.get("clicked_url")
     subject = payload.get("subject") or payload.get("email_subject") or "Loan status"
     
-    # Only process if we have a link (click events have links)
-    if not uuid or not link:
-        return {"ignored":"no_link"}
+    # Process all events - only send reply if we have a valid link with choice
+    if not link:
+        return {"ok":True,"processed":False,"reason":"no_link"}
     
-    # Extract ?c=option
+    if not uuid:
+        return {"ok":True,"processed":False,"reason":"no_email_id"}
+    
+    # Extract ?c=option from link
     from urllib.parse import urlparse, parse_qs
     try:
         choice = parse_qs(urlparse(link).query).get("c",[None])[0]
     except Exception as e:
         log(f"❌ parse_error link={link} error={str(e)}")
-        return {"error":"parse_error"}
+        return {"ok":True,"processed":False,"reason":"parse_error"}
     
     if not choice or choice not in ALL:
-        return {"ignored":"invalid_choice"}
+        return {"ok":True,"processed":False,"reason":"invalid_choice"}
     
+    # We have a valid choice - send reply
     remaining=[c for c in ALL if c!=choice]
     html=build_html(choice,remaining)
     
     # send thread-reply async (return 200 immediately)
     import asyncio; asyncio.create_task(reply(uuid,subject,html))
     
-    return {"ok":True,"next":remaining}
+    return {"ok":True,"processed":True,"choice":choice,"next":remaining}
 
 # ========== NO-PAGE CLICK ENDPOINT ==========
 @app.get("/qr")
