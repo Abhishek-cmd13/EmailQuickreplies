@@ -463,6 +463,20 @@ async def view_logs():
         <script>
             let autoRefreshInterval = null;
             let isAutoRefreshing = false;
+            let showAllLogs = false;
+
+            function toggleAllLogs() {
+                showAllLogs = !showAllLogs;
+                const btn = document.getElementById('allLogsBtn');
+                if (showAllLogs) {
+                    btn.textContent = '🔍 Show Webhooks Only';
+                    btn.style.background = '#89d185';
+                } else {
+                    btn.textContent = '📋 Show All Logs';
+                    btn.style.background = '#4a9eff';
+                }
+                refreshLogs();
+            }
 
             function formatLog(logEntry) {
                 const level = logEntry.level.toLowerCase();
