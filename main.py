@@ -85,11 +85,6 @@ async def instantly_webhook(req: Request):
     
     log(f"📥 webhook {payload}")
     
-    # ---- Validate campaign ----
-    cid = payload.get("campaign_id") or payload.get("campaign_uuid") or payload.get("campaign")
-    if cid!=ALLOWED_CAMPAIGN_ID: 
-        return {"ignored":"wrong_campaign"}
-    
     uuid    = payload.get("email_id") or payload.get("email_uuid") or payload.get("id")
     link    = payload.get("link") or payload.get("url") or payload.get("clicked_url")
     subject = payload.get("subject") or payload.get("email_subject") or "Loan status"
