@@ -71,7 +71,13 @@ app = FastAPI()
 
 @app.post("/webhook/instantly")
 async def instantly_webhook(req: Request):
-    payload = await req.json()
+    try:
+        payload = await req.json()
+    except:
+        body = await req.body()
+        log(f"❌ invalid_json body={body.decode('utf-8', errors='ignore')[:200]}")
+        return {"error":"invalid_json"}
+    
     log(f"📥 webhook {payload}")
     
     # ---- Validate campaign ----
@@ -80,17 +86,25 @@ async def instantly_webhook(req: Request):
         return {"ignored":"wrong_campaign"}
     
     # ---- Only click events ----
-    event = payload.get("event") or payload.get("type") or ""
+    event = payload.get("event") or payload.get("type") or payload.get("event_type") or ""
     if "click" not in event.lower(): 
         return {"ignored":"not_click"}
     
     uuid    = payload.get("email_id") or payload.get("email_uuid")
-    link    = payload.get("link") or payload.get("url")
+    link    = payload.get("link") or payload.get("url") or payload.get("clicked_url")
     subject = payload.get("subject") or "Loan status"
+    
+    if not uuid or not link:
+        log(f"❌ missing_data uuid={uuid} link={link}")
+        return {"error":"missing_data"}
     
     # Extract ?c=option
     from urllib.parse import urlparse, parse_qs
-    choice = parse_qs(urlparse(link).query).get("c",[None])[0]
+    try:
+        choice = parse_qs(urlparse(link).query).get("c",[None])[0]
+    except:
+        log(f"❌ parse_error link={link}")
+        return {"error":"parse_error"}
     
     if not choice or choice not in ALL:
         return {"ignored":"invalid_choice"}
