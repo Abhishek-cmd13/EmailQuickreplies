@@ -77,44 +77,12 @@ async def instantly_webhook(req: Request):
         body = await req.body()
         body_str = body.decode('utf-8', errors='ignore')[:200] if body else "(empty)"
         log(f"❌ invalid_json error={str(e)} body={body_str}")
-        return JSONResponse({"error":"invalid_json"}, status_code=400)
-    
-    if not payload:
-        log(f"❌ empty_payload")
-        return JSONResponse({"error":"empty_payload"}, status_code=400)
+        return {"ok":True}
     
     log(f"📥 webhook {payload}")
     
-    uuid    = payload.get("email_id") or payload.get("email_uuid") or payload.get("id")
-    link    = payload.get("link") or payload.get("url") or payload.get("clicked_url")
-    subject = payload.get("subject") or payload.get("email_subject") or "Loan status"
-    
-    # Process all events - only send reply if we have a valid link with choice
-    if not link:
-        return {"ok":True,"processed":False,"reason":"no_link"}
-    
-    if not uuid:
-        return {"ok":True,"processed":False,"reason":"no_email_id"}
-    
-    # Extract ?c=option from link
-    from urllib.parse import urlparse, parse_qs
-    try:
-        choice = parse_qs(urlparse(link).query).get("c",[None])[0]
-    except Exception as e:
-        log(f"❌ parse_error link={link} error={str(e)}")
-        return {"ok":True,"processed":False,"reason":"parse_error"}
-    
-    if not choice or choice not in ALL:
-        return {"ok":True,"processed":False,"reason":"invalid_choice"}
-    
-    # We have a valid choice - send reply
-    remaining=[c for c in ALL if c!=choice]
-    html=build_html(choice,remaining)
-    
-    # send thread-reply async (return 200 immediately)
-    import asyncio; asyncio.create_task(reply(uuid,subject,html))
-    
-    return {"ok":True,"processed":True,"choice":choice,"next":remaining}
+    # No actions taken - just log and return success
+    return {"ok":True}
 
 # ========== NO-PAGE CLICK ENDPOINT ==========
 @app.get("/qr")
