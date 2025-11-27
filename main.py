@@ -91,5 +91,11 @@ def qr_click():
 
 # ========== LOGS UI ==========
 @app.get("/logs")
-def logs(): return LOGS
+def logs(): 
+    return list(LOGS)
+
+@app.post("/logs/clear")
+def clear_logs():
+    LOGS.clear()
+    return {"ok": True, "message": "Logs cleared"}
 
