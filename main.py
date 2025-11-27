@@ -314,32 +314,55 @@ def get_campaign_id(payload: Dict[str, Any]) -> Optional[str]:
 # ─────────────────────────────
 @app.middleware("http")
 async def log_all_requests(request: Request, call_next):
-    """Log ALL POST requests to catch webhooks that might not match our endpoint"""
+    """Log ALL incoming requests - especially webhooks"""
     from datetime import datetime
     start_time = datetime.now()
     
-    # Log ALL POST requests to catch any webhook attempts
-    is_post_request = request.method == "POST"
+    # Log ALL requests to catch everything (webhooks might come in different forms)
+    request_path = request.url.path
+    request_method = request.method
     
-    if is_post_request:
+    # Always log POST requests (webhooks)
+    # Also log GET to /webhook (some services might ping it)
+    should_log = (
+        request_method == "POST" or 
+        "/webhook" in request_path
+    )
+    
+    if should_log:
         log.info("=" * 80)
-        log.info(f"🌐 INCOMING POST REQUEST: {request.method} {request.url.path}")
+        log.info(f"🌐 INCOMING REQUEST: {request_method} {request_path}")
         log.info(f"   Full URL: {request.url}")
         log.info(f"   Client: {request.client.host if request.client else 'unknown'}")
-        log.info(f"   User-Agent: {request.headers.get('user-agent', 'N/A')}")
+        log.info(f"   User-Agent: {request.headers.get('user-agent', 'N/A')[:150]}")
         log.info(f"   Content-Type: {request.headers.get('content-type', 'N/A')}")
         log.info(f"   Content-Length: {request.headers.get('content-length', 'N/A')}")
+        
+        # For POST requests, try to log body preview
+        if request_method == "POST":
+            try:
+                # Peek at body without consuming it
+                body_bytes = await request.body()
+                if body_bytes:
+                    try:
+                        import json
+                        body_json = json.loads(body_bytes)
+                        log.info(f"   Body preview: {json.dumps(body_json)[:500]}")
+                    except:
+                        log.info(f"   Body preview (non-JSON): {body_bytes[:200]}")
+            except:
+                pass
         log.info("=" * 80)
     
     try:
         response = await call_next(request)
-        if is_post_request:
+        if should_log:
             process_time = (datetime.now() - start_time).total_seconds()
-            log.info(f"✅ POST REQUEST COMPLETED: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.3f}s")
+            log.info(f"✅ REQUEST COMPLETED: {request_method} {request_path} - Status: {response.status_code} - Time: {process_time:.3f}s")
         return response
     except Exception as e:
-        if is_post_request:
-            log.error(f"❌ POST REQUEST ERROR: {request.method} {request.url.path} - {str(e)}")
+        if should_log:
+            log.error(f"❌ REQUEST ERROR: {request_method} {request_path} - {str(e)}")
             import traceback
             log.error(traceback.format_exc())
         raise
@@ -431,6 +454,7 @@ async def view_logs():
             <button id="refreshBtn" onclick="refreshLogs()">🔄 Refresh</button>
             <button id="clearBtn" onclick="clearLogs()">🗑️ Clear</button>
             <button id="autoRefreshBtn" onclick="toggleAutoRefresh()">⏸️ Auto-refresh</button>
+            <button id="allLogsBtn" onclick="toggleAllLogs()">📋 Show All Logs</button>
             <button onclick="fetch('/test/webhook', {method: 'POST'}).then(() => refreshLogs())">🧪 Test Webhook</button>
             <span id="status">● Live</span>
             <span style="color: #858585;">| Last updated: <span id="lastUpdate">-</span></span>
@@ -647,20 +671,26 @@ async def instantly_webhook(request: Request):
     
     # Log complete incoming request - THIS HAPPENS FOR ALL WEBHOOKS
     log.info("=" * 80)
-    log.info(f"📥 INCOMING WEBHOOK REQUEST - {datetime.now().isoformat()}")
-    log.info("=" * 80)
-    log.info(f"Headers: {dict(request.headers)}")
-    log.info(f"Method: {request.method}")
-    log.info(f"URL: {request.url}")
-    log.info(f"Client: {request.client.host if request.client else 'unknown'}")
+    log.info(f"📥 WEBHOOK ENDPOINT HIT - {datetime.now().isoformat()}")
+    log.info(f"   Path: {request.url.path}")
+    log.info(f"   Method: {request.method}")
+    log.info(f"   Full URL: {request.url}")
+    log.info(f"   Client: {request.client.host if request.client else 'unknown'}")
+    log.info("-" * 80)
+    log.info("REQUEST HEADERS:")
+    for key, value in request.headers.items():
+        log.info(f"   {key}: {value[:200] if len(str(value)) > 200 else value}")
     log.info("-" * 80)
     log.info("RAW BODY:")
     try:
-        body_json = json.loads(body) if body else {}
-        log.info(json.dumps(body_json, indent=2))
+        if body:
+            body_json = json.loads(body)
+            log.info(json.dumps(body_json, indent=2))
+        else:
+            log.info("(empty body)")
     except Exception as e:
         log.warning(f"Failed to parse body as JSON: {e}")
-        log.info(body.decode('utf-8', errors='ignore') if body else "(empty body)")
+        log.info(body.decode('utf-8', errors='ignore')[:1000] if body else "(empty body)")
     log.info("=" * 80)
 
     # Parse payload - handle errors gracefully
