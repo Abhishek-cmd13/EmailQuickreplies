@@ -364,171 +364,129 @@ async def health():
 
 @app.get("/logs", response_class=HTMLResponse)
 async def view_logs():
-    """HTML page to view logs with auto-refresh"""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Live Logs - Webhook Backend</title>
-        <style>
-            body {
-                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-                background: #1e1e1e;
-                color: #d4d4d4;
-                margin: 0;
-                padding: 20px;
-            }
-            h1 {
-                color: #4a9eff;
-                border-bottom: 2px solid #4a9eff;
-                padding-bottom: 10px;
-            }
-            #log-container {
-                background: #252526;
-                border: 1px solid #3e3e42;
-                border-radius: 4px;
-                padding: 15px;
-                max-height: 80vh;
-                overflow-y: auto;
-                white-space: pre-wrap;
-                font-size: 13px;
-                line-height: 1.5;
-            }
-            .log-entry {
-                margin: 2px 0;
-                padding: 2px 0;
-            }
-            .log-info { color: #4a9eff; }
-            .log-warning { color: #ffa500; }
-            .log-error { color: #f48771; }
-            .log-success { color: #89d185; }
-            .controls {
-                margin: 15px 0;
-                display: flex;
-                gap: 10px;
-                align-items: center;
-            }
-            button {
-                background: #4a9eff;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 14px;
-            }
-            button:hover { background: #3a8eef; }
-            button:disabled { background: #555; cursor: not-allowed; }
-            #status {
-                color: #89d185;
-                font-weight: bold;
-            }
-            .timestamp { color: #858585; }
-        </style>
-    </head>
-    <body>
-        <h1>📋 Live Logs Viewer</h1>
-        <div class="controls">
-            <button id="refreshBtn" onclick="refreshLogs()">🔄 Refresh</button>
-            <button id="clearBtn" onclick="clearLogs()">🗑️ Clear</button>
-            <button id="autoRefreshBtn" onclick="toggleAutoRefresh()">⏸️ Auto-refresh</button>
-            <button id="allLogsBtn" onclick="toggleAllLogs()">📋 Show All Logs</button>
-            <button onclick="fetch('/test/webhook', {method: 'POST'}).then(() => refreshLogs())">🧪 Test Webhook</button>
-            <span id="status">● Live</span>
-            <span style="color: #858585;">| Last updated: <span id="lastUpdate">-</span></span>
-        </div>
-        <div id="log-container"></div>
-        <script>
-            let autoRefreshInterval = null;
-            let isAutoRefreshing = false;
-            let showAllLogs = false;
+    """HTML page to view logs with auto-refresh - no styling"""
+    html_content = """<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Logs</title>
+    <meta charset="utf-8">
+</head>
+<body>
+    <h1>Live Logs Viewer</h1>
+    <div>
+        <button id="refreshBtn" onclick="refreshLogs()">Refresh</button>
+        <button id="clearBtn" onclick="clearLogs()">Clear</button>
+        <button id="autoRefreshBtn" onclick="toggleAutoRefresh()">Auto-refresh</button>
+        <button id="allLogsBtn" onclick="toggleAllLogs()">Show All Logs</button>
+        <button onclick="testWebhook()">Test Webhook</button>
+        <span id="status">Live</span>
+        <span>| Last updated: <span id="lastUpdate">-</span></span>
+    </div>
+    <div id="log-container"></div>
+    <script>
+        let autoRefreshInterval = null;
+        let isAutoRefreshing = false;
+        let showAllLogs = false;
 
-            function toggleAllLogs() {
-                showAllLogs = !showAllLogs;
-                const btn = document.getElementById('allLogsBtn');
-                if (showAllLogs) {
-                    btn.textContent = '🔍 Show Webhooks Only';
-                    btn.style.background = '#89d185';
-                } else {
-                    btn.textContent = '📋 Show All Logs';
-                    btn.style.background = '#4a9eff';
-                }
-                refreshLogs();
+        function toggleAllLogs() {
+            showAllLogs = !showAllLogs;
+            var btn = document.getElementById('allLogsBtn');
+            if (showAllLogs) {
+                btn.textContent = 'Show Webhooks Only';
+            } else {
+                btn.textContent = 'Show All Logs';
             }
-
-            function formatLog(logEntry) {
-                const level = logEntry.level.toLowerCase();
-                const timestamp = logEntry.timestamp ? new Date(logEntry.timestamp).toLocaleTimeString() : '';
-                const levelClass = `log-${level}`;
-                return `<div class="log-entry ${levelClass}"><span class="timestamp">[${timestamp}]</span> ${escapeHtml(logEntry.message)}</div>`;
-            }
-
-            function escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-
-            async function refreshLogs() {
-                try {
-                    // Fetch logs - show all if toggle is on, otherwise filtered
-                    const url = showAllLogs ? '/logs/all?limit=500' : '/logs/json?limit=500';
-                    const response = await fetch(url);
-                    if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
-                    }
-                    const logs = await response.json();
-                    const container = document.getElementById('log-container');
-                    
-                    if (!Array.isArray(logs)) {
-                        container.innerHTML = '<div style="color: #f48771;">Error: Invalid response format</div>';
-                        return;
-                    }
-                    
-                    if (logs.length === 0) {
-                        container.innerHTML = '<div style="color: #858585;">No webhook logs yet.<br>Waiting for webhooks from Instantly.ai...<br><br>When a webhook arrives, you\'ll see:<br>- Full request headers and payload<br>- Campaign ID validation<br>- Event processing<br>- Reply sending status</div>';
-                        return;
-                    }
-                    
-                    container.innerHTML = logs.map(formatLog).join('');
-                    container.scrollTop = container.scrollHeight;
-                    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
-                } catch (error) {
-                    console.error('Error fetching logs:', error);
-                    const container = document.getElementById('log-container');
-                    container.innerHTML = `<div style="color: #f48771;">Error loading logs: ${error.message}</div>`;
-                }
-            }
-
-            function clearLogs() {
-                fetch('/logs/clear', { method: 'POST' });
-                document.getElementById('log-container').innerHTML = '';
-            }
-
-            function toggleAutoRefresh() {
-                const btn = document.getElementById('autoRefreshBtn');
-                if (isAutoRefreshing) {
-                    clearInterval(autoRefreshInterval);
-                    btn.textContent = '▶️ Auto-refresh';
-                    btn.style.background = '#4a9eff';
-                    isAutoRefreshing = false;
-                    document.getElementById('status').textContent = '● Paused';
-                } else {
-                    autoRefreshInterval = setInterval(refreshLogs, 1000);
-                    btn.textContent = '⏸️ Auto-refresh';
-                    btn.style.background = '#89d185';
-                    isAutoRefreshing = true;
-                    document.getElementById('status').textContent = '● Live';
-                }
-            }
-
-            // Initial load and start auto-refresh
             refreshLogs();
-            toggleAutoRefresh();
-        </script>
-    </body>
-    </html>
-    """
+        }
+
+        function escapeHtml(text) {
+            var div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatLog(logEntry) {
+            var timestamp = '';
+            if (logEntry.timestamp) {
+                timestamp = new Date(logEntry.timestamp).toLocaleTimeString();
+            }
+            var level = logEntry.level || 'INFO';
+            return '<div>[' + timestamp + '] [' + level + '] ' + escapeHtml(logEntry.message) + '</div>';
+        }
+
+        function refreshLogs() {
+            try {
+                var url = showAllLogs ? '/logs/all?limit=500' : '/logs/json?limit=500';
+                fetch(url)
+                    .then(function(response) {
+                        if (!response.ok) {
+                            throw new Error('HTTP error! status: ' + response.status);
+                        }
+                        return response.json();
+                    })
+                    .then(function(logs) {
+                        var container = document.getElementById('log-container');
+                        if (!Array.isArray(logs)) {
+                            container.innerHTML = '<div>Error: Invalid response format</div>';
+                            return;
+                        }
+                        if (logs.length === 0) {
+                            container.innerHTML = '<div>No webhook logs yet. Waiting for webhooks from Instantly.ai...</div>';
+                            return;
+                        }
+                        var html = '';
+                        for (var i = 0; i < logs.length; i++) {
+                            html += formatLog(logs[i]);
+                        }
+                        container.innerHTML = html;
+                        container.scrollTop = container.scrollHeight;
+                        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                    })
+                    .catch(function(error) {
+                        console.error('Error fetching logs:', error);
+                        var container = document.getElementById('log-container');
+                        container.innerHTML = '<div>Error loading logs: ' + error.message + '</div>';
+                    });
+            } catch (error) {
+                console.error('Error in refreshLogs:', error);
+                var container = document.getElementById('log-container');
+                container.innerHTML = '<div>Error: ' + error.message + '</div>';
+            }
+        }
+
+        function clearLogs() {
+            fetch('/logs/clear', { method: 'POST' });
+            document.getElementById('log-container').innerHTML = '';
+        }
+
+        function toggleAutoRefresh() {
+            var btn = document.getElementById('autoRefreshBtn');
+            if (isAutoRefreshing) {
+                clearInterval(autoRefreshInterval);
+                btn.textContent = 'Auto-refresh';
+                isAutoRefreshing = false;
+                document.getElementById('status').textContent = 'Paused';
+            } else {
+                autoRefreshInterval = setInterval(refreshLogs, 1000);
+                btn.textContent = 'Stop Auto-refresh';
+                isAutoRefreshing = true;
+                document.getElementById('status').textContent = 'Live';
+            }
+        }
+
+        function testWebhook() {
+            fetch('/test/webhook', {method: 'POST'})
+                .then(function() {
+                    refreshLogs();
+                });
+        }
+
+        refreshLogs();
+        toggleAutoRefresh();
+    </script>
+</body>
+</html>"""
+    return html_content
 
 
 @app.get("/logs/json")
