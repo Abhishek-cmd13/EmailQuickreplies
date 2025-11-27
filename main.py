@@ -73,10 +73,7 @@ root_logger = logging.getLogger()
 root_logger.addHandler(buffer_handler)
 root_logger.setLevel(logging.DEBUG)
 
-# Test that logging is working
-log.info("=" * 80)
-log.info("🔴 LOG BUFFER INITIALIZED - All logs will be captured")
-log.info("=" * 80)
+# Log buffer is ready (don't log initialization to keep logs clean)
 
 # ─────────────────────────────
 # OPTIONS / LABELS
@@ -317,34 +314,37 @@ def get_campaign_id(payload: Dict[str, Any]) -> Optional[str]:
 # ─────────────────────────────
 @app.middleware("http")
 async def log_all_requests(request: Request, call_next):
-    """Log ALL incoming requests to catch webhooks that might not match our endpoint"""
+    """Log webhook requests only - skip other requests to reduce noise"""
     from datetime import datetime
     start_time = datetime.now()
     
-    # Log every request - especially important for webhooks
-    log.info("=" * 80)
-    log.info(f"🌐 INCOMING REQUEST: {request.method} {request.url.path}")
-    log.info(f"   Full URL: {request.url}")
-    log.info(f"   Client: {request.client.host if request.client else 'unknown'}")
-    log.info(f"   User-Agent: {request.headers.get('user-agent', 'N/A')}")
+    # Only log webhook requests, ignore everything else
+    is_webhook_request = (
+        request.method in ["POST", "PUT"] 
+        and "/webhook" in request.url.path
+    )
     
-    # For POST/PUT requests to webhook endpoints, log that we're receiving it
-    if request.method in ["POST", "PUT"] and "/webhook" in request.url.path:
-        log.info(f"   ⚠️  WEBHOOK-LIKE REQUEST DETECTED")
+    if is_webhook_request:
+        log.info("=" * 80)
+        log.info(f"🌐 INCOMING REQUEST: {request.method} {request.url.path}")
+        log.info(f"   Full URL: {request.url}")
+        log.info(f"   Client: {request.client.host if request.client else 'unknown'}")
+        log.info(f"   User-Agent: {request.headers.get('user-agent', 'N/A')}")
         log.info(f"   Content-Type: {request.headers.get('content-type', 'N/A')}")
         log.info(f"   Content-Length: {request.headers.get('content-length', 'N/A')}")
-    
-    log.info("=" * 80)
+        log.info("=" * 80)
     
     try:
         response = await call_next(request)
-        process_time = (datetime.now() - start_time).total_seconds()
-        log.info(f"✅ REQUEST COMPLETED: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.3f}s")
+        if is_webhook_request:
+            process_time = (datetime.now() - start_time).total_seconds()
+            log.info(f"✅ REQUEST COMPLETED: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.3f}s")
         return response
     except Exception as e:
-        log.error(f"❌ REQUEST ERROR: {request.method} {request.url.path} - {str(e)}")
-        import traceback
-        log.error(traceback.format_exc())
+        if is_webhook_request:
+            log.error(f"❌ REQUEST ERROR: {request.method} {request.url.path} - {str(e)}")
+            import traceback
+            log.error(traceback.format_exc())
         raise
 
 
@@ -354,7 +354,7 @@ async def log_all_requests(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    log.info("Health check endpoint accessed")
+    # Don't log health checks to avoid clutter in webhook logs
     return {
         "status": "ok",
         "instantly_configured": bool(INSTANTLY_API_KEY and INSTANTLY_EACCOUNT),
@@ -458,8 +458,8 @@ async def view_logs():
 
             async function refreshLogs() {
                 try {
-                    // Filter out debug messages about log endpoint access
-                    const response = await fetch('/logs/json?limit=500&filter_debug=true');
+                    // Server now filters to only webhook-related logs
+                    const response = await fetch('/logs/json?limit=500');
                     if (!response.ok) {
                         throw new Error(`HTTP error! status: ${response.status}`);
                     }
@@ -472,7 +472,7 @@ async def view_logs():
                     }
                     
                     if (logs.length === 0) {
-                        container.innerHTML = '<div style="color: #858585;">No logs yet. Logs will appear here when webhooks are received.<br>Try triggering a webhook or click the test button below.</div>';
+                        container.innerHTML = '<div style="color: #858585;">No webhook logs yet.<br>Waiting for webhooks from Instantly.ai...<br><br>When a webhook arrives, you\'ll see:<br>- Full request headers and payload<br>- Campaign ID validation<br>- Event processing<br>- Reply sending status</div>';
                         return;
                     }
                     
@@ -518,25 +518,50 @@ async def view_logs():
 
 
 @app.get("/logs/json")
-async def get_logs_json(limit: int = 500, filter_debug: bool = True):
-    """Get logs as JSON"""
-    # Don't log debug messages for logs endpoint access to avoid clutter
+async def get_logs_json(limit: int = 500):
+    """Get logs as JSON - only webhook-related logs"""
     logs = list(LOG_BUFFER)
+    
+    # Filter to only show webhook-related logs
+    webhook_keywords = [
+        "WEBHOOK",
+        "📥",
+        "INCOMING WEBHOOK",
+        "INCOMING REQUEST: POST /webhook",
+        "CAMPAIGN ID",
+        "EVENT TYPE",
+        "EXTRACTED DATA",
+        "REJECTED",
+        "VALIDATED",
+        "PROCESSING",
+        "SENDING REPLY",
+        "REPLY SENT",
+        "click event",
+        "email_uuid",
+        "clicked_link",
+        "choice",
+        "remaining_choices"
+    ]
+    
+    # Only keep logs that contain webhook-related keywords
+    filtered_logs = []
+    for log_entry in logs:
+        message = log_entry.get("message", "")
+        if any(keyword in message for keyword in webhook_keywords):
+            filtered_logs.append(log_entry)
+    
+    # Apply limit
     if limit:
-        logs = logs[-limit:]
+        filtered_logs = filtered_logs[-limit:]
     
-    # Filter out debug messages about log endpoint access if requested
-    if filter_debug:
-        logs = [log_entry for log_entry in logs if "Logs endpoint accessed" not in log_entry.get("message", "")]
-    
-    return logs
+    return filtered_logs
 
 
 @app.post("/logs/clear")
 async def clear_logs():
     """Clear the log buffer"""
     LOG_BUFFER.clear()
-    log.info("Log buffer cleared by user")
+    # Don't log the clear action to avoid clutter
     return {"status": "ok", "message": "Log buffer cleared"}
 
 
