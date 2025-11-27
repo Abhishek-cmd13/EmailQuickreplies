@@ -524,7 +524,10 @@ async def get_logs_json(limit: int = 500):
         "WEBHOOK",
         "📥",
         "INCOMING WEBHOOK",
-        "INCOMING REQUEST: POST /webhook",
+        "INCOMING POST REQUEST",
+        "POST REQUEST",
+        "INCOMING REQUEST: POST",
+        "WEBHOOK ENDPOINT HIT",
         "CAMPAIGN ID",
         "EVENT TYPE",
         "EXTRACTED DATA",
@@ -537,7 +540,8 @@ async def get_logs_json(limit: int = 500):
         "email_uuid",
         "clicked_link",
         "choice",
-        "remaining_choices"
+        "remaining_choices",
+        "/webhook"
     ]
     
     # Only keep logs that contain webhook-related keywords
@@ -575,6 +579,22 @@ async def test_webhook():
         "status": "ok",
         "message": "Test webhook logged. Check /logs to see the entries.",
         "log_buffer_size": len(LOG_BUFFER)
+    }
+
+
+@app.get("/webhook-status")
+async def webhook_status():
+    """Diagnostic endpoint to check webhook configuration"""
+    total_logs = len(LOG_BUFFER)
+    webhook_logs = [log for log in LOG_BUFFER if any(kw in log.get("message", "").upper() for kw in ["WEBHOOK", "POST REQUEST", "📥"])]
+    
+    return {
+        "status": "ok",
+        "webhook_endpoint": "/webhook/instantly",
+        "total_logs_in_buffer": total_logs,
+        "webhook_related_logs": len(webhook_logs),
+        "recent_webhook_logs": webhook_logs[-5:] if webhook_logs else [],
+        "note": "If webhook_related_logs is 0, webhooks are not reaching the server. Check Instantly.ai webhook URL configuration."
     }
 
 
