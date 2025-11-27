@@ -479,8 +479,9 @@ async def view_logs():
 
             async function refreshLogs() {
                 try {
-                    // Server now filters to only webhook-related logs
-                    const response = await fetch('/logs/json?limit=500');
+                    // Fetch logs - show all if toggle is on, otherwise filtered
+                    const url = showAllLogs ? '/logs/all?limit=500' : '/logs/json?limit=500';
+                    const response = await fetch(url);
                     if (!response.ok) {
                         throw new Error(`HTTP error! status: ${response.status}`);
                     }
