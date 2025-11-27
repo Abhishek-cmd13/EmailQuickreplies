@@ -314,19 +314,16 @@ def get_campaign_id(payload: Dict[str, Any]) -> Optional[str]:
 # ─────────────────────────────
 @app.middleware("http")
 async def log_all_requests(request: Request, call_next):
-    """Log webhook requests only - skip other requests to reduce noise"""
+    """Log ALL POST requests to catch webhooks that might not match our endpoint"""
     from datetime import datetime
     start_time = datetime.now()
     
-    # Only log webhook requests, ignore everything else
-    is_webhook_request = (
-        request.method in ["POST", "PUT"] 
-        and "/webhook" in request.url.path
-    )
+    # Log ALL POST requests to catch any webhook attempts
+    is_post_request = request.method == "POST"
     
-    if is_webhook_request:
+    if is_post_request:
         log.info("=" * 80)
-        log.info(f"🌐 INCOMING REQUEST: {request.method} {request.url.path}")
+        log.info(f"🌐 INCOMING POST REQUEST: {request.method} {request.url.path}")
         log.info(f"   Full URL: {request.url}")
         log.info(f"   Client: {request.client.host if request.client else 'unknown'}")
         log.info(f"   User-Agent: {request.headers.get('user-agent', 'N/A')}")
@@ -336,13 +333,13 @@ async def log_all_requests(request: Request, call_next):
     
     try:
         response = await call_next(request)
-        if is_webhook_request:
+        if is_post_request:
             process_time = (datetime.now() - start_time).total_seconds()
-            log.info(f"✅ REQUEST COMPLETED: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.3f}s")
+            log.info(f"✅ POST REQUEST COMPLETED: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.3f}s")
         return response
     except Exception as e:
-        if is_webhook_request:
-            log.error(f"❌ REQUEST ERROR: {request.method} {request.url.path} - {str(e)}")
+        if is_post_request:
+            log.error(f"❌ POST REQUEST ERROR: {request.method} {request.url.path} - {str(e)}")
             import traceback
             log.error(traceback.format_exc())
         raise
