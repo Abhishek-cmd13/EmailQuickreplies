@@ -90,18 +90,13 @@ async def instantly_webhook(req: Request):
     if cid!=ALLOWED_CAMPAIGN_ID: 
         return {"ignored":"wrong_campaign"}
     
-    # ---- Only click events ----
-    event = payload.get("event") or payload.get("type") or payload.get("event_type") or ""
-    if "click" not in event.lower(): 
-        return {"ignored":"not_click"}
-    
     uuid    = payload.get("email_id") or payload.get("email_uuid") or payload.get("id")
     link    = payload.get("link") or payload.get("url") or payload.get("clicked_url")
     subject = payload.get("subject") or payload.get("email_subject") or "Loan status"
     
+    # Only process if we have a link (click events have links)
     if not uuid or not link:
-        log(f"❌ missing_data uuid={uuid} link={link}")
-        return {"error":"missing_data"}
+        return {"ignored":"no_link"}
     
     # Extract ?c=option
     from urllib.parse import urlparse, parse_qs
