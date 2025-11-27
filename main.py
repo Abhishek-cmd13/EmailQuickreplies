@@ -586,15 +586,27 @@ async def test_webhook():
 async def webhook_status():
     """Diagnostic endpoint to check webhook configuration"""
     total_logs = len(LOG_BUFFER)
-    webhook_logs = [log for log in LOG_BUFFER if any(kw in log.get("message", "").upper() for kw in ["WEBHOOK", "POST REQUEST", "📥"])]
+    
+    # Find all POST request logs
+    post_logs = [log for log in LOG_BUFFER if "POST REQUEST" in log.get("message", "").upper()]
+    webhook_endpoint_logs = [log for log in LOG_BUFFER if "/webhook" in log.get("message", "") or "WEBHOOK ENDPOINT" in log.get("message", "").upper()]
     
     return {
         "status": "ok",
-        "webhook_endpoint": "/webhook/instantly",
+        "webhook_endpoint_url": "https://emailquickreplies.onrender.com/webhook/instantly",
         "total_logs_in_buffer": total_logs,
-        "webhook_related_logs": len(webhook_logs),
-        "recent_webhook_logs": webhook_logs[-5:] if webhook_logs else [],
-        "note": "If webhook_related_logs is 0, webhooks are not reaching the server. Check Instantly.ai webhook URL configuration."
+        "total_post_requests": len(post_logs),
+        "webhook_endpoint_hits": len(webhook_endpoint_logs),
+        "recent_post_requests": post_logs[-5:] if post_logs else [],
+        "recent_webhook_logs": webhook_endpoint_logs[-5:] if webhook_endpoint_logs else [],
+        "diagnosis": "If total_post_requests is 0, Instantly.ai is not sending webhooks to your server. Check Instantly.ai dashboard → Webhooks → Ensure URL is set correctly.",
+        "checklist": [
+            "1. Go to Instantly.ai Dashboard → Settings → Webhooks",
+            "2. Verify webhook URL is: https://emailquickreplies.onrender.com/webhook/instantly",
+            "3. Ensure CLICK events are enabled",
+            "4. Remove Slack webhook if you only want your app to receive webhooks",
+            "5. Save and test by clicking a button in an email"
+        ]
     }
 
 
