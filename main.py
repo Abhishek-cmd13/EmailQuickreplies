@@ -633,28 +633,45 @@ async def instantly_webhook(request: Request):
         log.info(f"   {key}: {value[:200] if len(str(value)) > 200 else value}")
     log.info("-" * 80)
     log.info("RAW BODY:")
+    body_json = None
     try:
         if body:
             body_json = json.loads(body)
             log.info(json.dumps(body_json, indent=2))
         else:
-            log.info("(empty body)")
+            log.warning("(empty body - no data received)")
     except Exception as e:
         log.warning(f"Failed to parse body as JSON: {e}")
-        log.info(body.decode('utf-8', errors='ignore')[:1000] if body else "(empty body)")
+        body_text = body.decode('utf-8', errors='ignore')[:1000] if body else "(empty body)"
+        log.info(body_text)
     log.info("=" * 80)
 
     # Parse payload - handle errors gracefully
     try:
         # If we already parsed it, use that, otherwise parse again
-        if 'body_json' in locals():
+        if body_json is not None:
             payload = body_json
         else:
             payload = await request.json()
         
-        # Log parsed payload
-        log.info("PARSED PAYLOAD:")
+        # Log parsed payload with all keys visible
+        log.info("=" * 80)
+        log.info("FULL PAYLOAD CONTENT:")
+        log.info("=" * 80)
         log.info(json.dumps(payload, indent=2))
+        log.info("=" * 80)
+        log.info("ALL PAYLOAD FIELDS (for debugging):")
+        log.info("-" * 80)
+        if payload:
+            for key in sorted(payload.keys()):
+                value = payload[key]
+                value_str = str(value)
+                if len(value_str) > 200:
+                    value_str = value_str[:200] + "... (truncated)"
+                log.info(f"  '{key}' ({type(value).__name__}): {value_str}")
+        else:
+            log.warning("  ⚠️  PAYLOAD IS EMPTY!")
+        log.info("-" * 80)
     except Exception as e:
         log.error(f"Failed to parse request as JSON: {e}")
         log.info("Proceeding with empty payload for validation")
@@ -664,15 +681,23 @@ async def instantly_webhook(request: Request):
     campaign_id = get_campaign_id(payload)
     
     log.info("-" * 80)
-    log.info("CAMPAIGN ID VALIDATION:")
-    log.info(f"  Received campaign_id: {campaign_id}")
+    log.info("CAMPAIGN ID EXTRACTION:")
+    log.info(f"  Extracted campaign_id: {campaign_id if campaign_id else 'None (not found)'}")
     log.info(f"  Allowed campaign_id: {ALLOWED_CAMPAIGN_ID}")
+    log.info("-" * 80)
+    log.info("CHECKED FIELDS FOR campaign_id:")
+    log.info(f"  - payload.get('campaign_id'): {payload.get('campaign_id')}")
+    log.info(f"  - payload.get('campaignId'): {payload.get('campaignId')}")
+    log.info(f"  - payload.get('campaign_uuid'): {payload.get('campaign_uuid')}")
+    log.info(f"  - payload.get('campaign'): {payload.get('campaign')}")
+    log.info("-" * 80)
     
     if not campaign_id:
+        log.warning("=" * 80)
         log.warning("❌ REJECTED: campaign_id missing from payload")
-        log.info("=" * 80)
-        log.info("✅ WEBHOOK LOGGED (rejected but logged for debugging)")
-        log.info("=" * 80)
+        log.warning("  This webhook will be ignored because campaign_id could not be found.")
+        log.warning("  Check the 'ALL PAYLOAD FIELDS' section above to see what fields ARE present.")
+        log.warning("=" * 80)
         return JSONResponse({
             "status": "ignored",
             "reason": "missing_campaign_id",
@@ -709,7 +734,9 @@ async def instantly_webhook(request: Request):
         return JSONResponse({"status": "ignored", "reason": "no_event_type"})
 
     # We only care about click events for this flow
-    if "click" not in event_type.lower():
+    # Instantly.ai sends event_type as "email_link_clicked" (official) or "click" (some variations)
+    event_type_lower = event_type.lower()
+    if "click" not in event_type_lower:
         log.info(f"⚠️  IGNORED: Event type '{event_type}' is not a click event")
         log.info("=" * 80)
         log.info("✅ WEBHOOK LOGGED (ignored but logged for debugging)")
