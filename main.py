@@ -144,7 +144,15 @@ app = FastAPI()
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     host = request.headers.get("host", "unknown")
-    log(f"🌐 REQUEST: {request.method} {request.url.path} | Host: {host} | Client: {request.client.host if request.client else 'unknown'}")
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # Enhanced logging for GET requests (especially click tracking)
+    if request.method == "GET":
+        query_params = dict(request.query_params)
+        query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()]) if query_params else ""
+        log(f"🌐 REQUEST: {request.method} {request.url.path}{query_str} | Host: {host} | Client: {client_ip}")
+    else:
+        log(f"🌐 REQUEST: {request.method} {request.url.path} | Host: {host} | Client: {client_ip}")
     
     # Log headers for webhook requests
     if request.url.path == "/webhook/instantly":
@@ -290,6 +298,161 @@ async def qr_click(request: Request):
 @app.get("/logs")
 def logs(): 
     return list(LOGS)
+
+@app.get("/logs/get-requests")
+def logs_get_requests():
+    """Filter logs to show only GET requests (click tracking)"""
+    # Filter GET requests but exclude log endpoints and status endpoints
+    exclude_paths = ["/logs", "/status", "/test"]
+    get_logs = [
+        log for log in LOGS 
+        if "REQUEST: GET" in log.get("m", "") 
+        and not any(excluded in log.get("m", "") for excluded in exclude_paths)
+    ]
+    return list(get_logs[-100:])  # Last 100 GET requests
+
+@app.get("/logs/live")
+def logs_live_html():
+    """Live log viewer page that auto-refreshes - shows GET requests only"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Live GET Request Logs - Production Tracking</title>
+        <meta charset="UTF-8">
+        <meta http-equiv="refresh" content="2">
+        <style>
+            body {
+                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                margin: 0;
+                padding: 20px;
+            }
+            .header {
+                background: #2d2d30;
+                padding: 15px;
+                border-radius: 5px;
+                margin-bottom: 20px;
+                position: sticky;
+                top: 0;
+                z-index: 100;
+            }
+            .header h1 {
+                margin: 0;
+                color: #4ec9b0;
+            }
+            .header p {
+                margin: 5px 0 0 0;
+                color: #858585;
+                font-size: 12px;
+            }
+            .log-container {
+                background: #252526;
+                border-radius: 5px;
+                padding: 15px;
+                max-height: 80vh;
+                overflow-y: auto;
+            }
+            .log-entry {
+                padding: 8px;
+                margin: 5px 0;
+                border-left: 3px solid #007acc;
+                background: #1e1e1e;
+                border-radius: 3px;
+                word-wrap: break-word;
+            }
+            .log-time {
+                color: #858585;
+                font-size: 11px;
+            }
+            .log-message {
+                color: #d4d4d4;
+                margin-top: 5px;
+            }
+            .log-message:contains("LINK_CLICKED") {
+                color: #4ec9b0;
+            }
+            .refresh-indicator {
+                display: inline-block;
+                width: 10px;
+                height: 10px;
+                background: #0f0;
+                border-radius: 50%;
+                animation: blink 2s infinite;
+            }
+            @keyframes blink {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.3; }
+            }
+            .stats {
+                display: inline-block;
+                margin-left: 20px;
+                color: #858585;
+            }
+            .click-highlight {
+                background: #2a4a2a !important;
+                border-left-color: #4ec9b0 !important;
+            }
+            .click-highlight .log-message {
+                color: #4ec9b0;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🔍 Live GET Request Tracker <span class="refresh-indicator"></span></h1>
+            <p>Auto-refreshing every 2 seconds • Showing GET requests only • Production monitoring</p>
+        </div>
+        <div class="log-container" id="logs">
+            <p style="color: #858585;">Loading logs...</p>
+        </div>
+        
+        <script>
+            async function loadLogs() {
+                try {
+                    const response = await fetch('/logs/get-requests');
+                    const logs = await response.json();
+                    const container = document.getElementById('logs');
+                    
+                    if (logs.length === 0) {
+                        container.innerHTML = '<p style="color: #858585;">No GET requests yet. Waiting for clicks...</p>';
+                        return;
+                    }
+                    
+                    let html = '';
+                    logs.slice().reverse().forEach(log => {
+                        const isClick = log.m && (log.m.includes('LINK_CLICKED') || log.m.includes('Stored choice'));
+                        const logClass = isClick ? 'log-entry click-highlight' : 'log-entry';
+                        html += `
+                            <div class="${logClass}">
+                                <div class="log-time">${log.t || ''}</div>
+                                <div class="log-message">${escapeHtml(log.m || '')}</div>
+                            </div>
+                        `;
+                    });
+                    container.innerHTML = html;
+                } catch (error) {
+                    document.getElementById('logs').innerHTML = `<p style="color: #f48771;">Error loading logs: ${error.message}</p>`;
+                }
+            }
+            
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+            
+            // Load immediately
+            loadLogs();
+            
+            // Auto-refresh every 2 seconds
+            setInterval(loadLogs, 2000);
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
 
 @app.post("/logs/clear")
 def clear_logs():
