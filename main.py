@@ -58,7 +58,7 @@ RECENT_CLICKS = deque(maxlen=100)
 EMAIL_CLICK_TTL_SECONDS = 3600  # one hour safety window
 
 # Paths to exclude from email click tracking logs
-NON_EMAIL_PATHS = {"/logs", "/status", "/test", "/qr", "/favicon.ico", "/lt", "/webhook"}
+NON_EMAIL_PATHS = {"/logs", "/status", "/test", "/qr", "/favicon.ico", "/lt", "/webhook", "/robots.txt", "/.well-known"}
 
 def is_email_click_path(path: str) -> bool:
     """Check if path is an email click tracking path"""
@@ -354,8 +354,8 @@ def logs():
 
 @app.get("/logs/get-requests")
 def logs_get_requests():
-    """Filter logs to show only email click tracking GET requests"""
-    # Only show email click tracking requests and related events
+    """Filter logs to show only email click tracking GET requests and webhook events"""
+    # Only show email click tracking requests, webhook events, and related events
     email_logs = [
         log for log in LOGS 
         if any(keyword in log.get("m", "") for keyword in [
@@ -363,10 +363,15 @@ def logs_get_requests():
             "EMAIL_CLICK_RESPONSE", 
             "LINK_CLICKED",
             "EMAIL_MATCHING",
+            "EMAIL_STORED",
             "Stored choice",
             "Matched",
             "REPLY_SENT",
-            "REPLY_FAILED"
+            "REPLY_FAILED",
+            "WEBHOOK",
+            "EMAIL_ID",
+            "EMAIL_CLICK_STORED",
+            "EMAIL_CLICK_WAITING"
         ])
     ]
     return list(email_logs[-100:])  # Last 100 email-related logs
@@ -612,22 +617,29 @@ def test_webhook():
 @app.get("/{path_choice}")
 async def link_click(path_choice: str, request: Request):
     """Handle path-based links like /settle, /close, /human - catch-all route at end"""
+    # Skip favicon and other non-email paths silently - return immediately without logging
+    skip_paths = {"favicon.ico", "robots.txt", ".well-known"}
+    path_lower = path_choice.lower()
+    if path_lower in skip_paths or any(path_lower.startswith(skip) for skip in skip_paths):
+        return PlainTextResponse("", status_code=204)  # Silent ignore - no logging
+    
     client_ip = request.client.host if request.client else "unknown"
-
+    
     # Map path to choice
-    choice = PATH_TO_CHOICE.get(path_choice.lower(), "unknown")
+    choice = PATH_TO_CHOICE.get(path_lower, "unknown")
     
-    log(f"🔗 LINK_CLICKED: /{path_choice} → choice: {choice} | IP: {client_ip}")
-
-    query_params = dict(request.query_params)
-    email_param = (
-        query_params.get("email")
-        or query_params.get("lead_email")
-        or query_params.get("recipient")
-    )
-    
-    # Store the click with timestamp - webhook will match within 60 seconds
+    # Only log and process if it's a valid email click path
     if choice != "unknown":
+        log(f"🔗 LINK_CLICKED: /{path_choice} → choice: {choice} | IP: {client_ip}")
+
+        query_params = dict(request.query_params)
+        email_param = (
+            query_params.get("email")
+            or query_params.get("lead_email")
+            or query_params.get("recipient")
+        )
+        
+        # Store the click with timestamp - webhook will match within 60 seconds
         if email_param:
             store_email_click(email_param, choice, client_ip)
             log(f"💾 EMAIL_CLICK_STORED: Choice '{choice}' stored for email '{email_param}' - ready for email-based matching")
@@ -635,7 +647,7 @@ async def link_click(path_choice: str, request: Request):
             log(f"⚠️ EMAIL_CLICK_NO_EMAIL: Choice '{choice}' stored without email parameter - will use time-based fallback")
         RECENT_CLICKS.append((datetime.now(), choice, client_ip))
         log(f"⏳ EMAIL_CLICK_WAITING: Waiting for Instantly.ai webhook to trigger automatic reply")
-    else:
-        log(f"⚠️ EMAIL_CLICK_UNKNOWN: Unknown path choice: {path_choice} - not a valid email click")
+    # Don't log unknown paths - just return silently
+    
     return PlainTextResponse("",status_code=204)  # invisible
 
