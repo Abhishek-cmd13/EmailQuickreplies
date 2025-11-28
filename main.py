@@ -912,8 +912,9 @@ async def instantly_webhook(req: Request, bg: BackgroundTasks):
     # Queue heavy processing to background task
     bg.add_task(process_webhook_logic, payload)
     
-    # Return immediately (< 100ms target)
-    return {"ok": True, "queued": True}
+    # Return immediately (< 100ms target) with confirmation
+    log(f"✅ WEBHOOK_ACCEPTED: Webhook queued for background processing, returning 200 OK")
+    return {"ok": True, "status": "accepted", "message": "webhook received and queued for processing"}
 
 
 # ========== HANDLE INSTANTLY.AI TRACKING (if inst.riverline.credit points to us) ==========
