@@ -91,17 +91,17 @@ def store_email_click(email: str, choice: str, client_ip: str) -> None:
     if pruned_count > 0:
         log(f"🧹 EMAIL_STORAGE_CLEANUP: Pruned {pruned_count} stale email entries")
 
-async def find_email_id_for_lead(lead_email: str, campaign_id: str = None):
-    """Try to find email_id for a lead using Instantly.ai API"""
+async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: str = None):
+    """Try to find email uuid and subject for a lead using Instantly.ai API"""
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             # Try to get campaign emails
             url = "https://api.instantly.ai/api/v2/emails/list"
-            params = {"eaccount": INSTANTLY_EACCOUNT, "email": lead_email}
+            params = {"eaccount": eaccount, "email": lead_email}
             if campaign_id:
                 params["campaign_id"] = campaign_id
             
-            log(f"🔍 Looking up email_id for {lead_email} (campaign: {campaign_id or 'all'})")
+            log(f"🔍 Looking up email uuid for {lead_email} (eaccount: {eaccount}, campaign: {campaign_id or 'all'})")
             r = await c.get(url, params=params, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
             
             log(f"📡 API Response: Status {r.status_code}")
@@ -112,19 +112,21 @@ async def find_email_id_for_lead(lead_email: str, campaign_id: str = None):
                 log(f"📧 Found {len(emails)} email(s) for {lead_email}")
                 
                 if emails:
-                    # Get most recent email
-                    latest = sorted(emails, key=lambda x: x.get("sent_at", ""), reverse=True)[0]
-                    email_id = latest.get("id") or latest.get("email_id")
-                    log(f"✅ Found email_id: {email_id}")
-                    return email_id
+                    # Sort by sent_at (most recent first)
+                    emails.sort(key=lambda x: x.get("sent_at", ""), reverse=True)
+                    latest = emails[0]
+                    uuid = latest.get("uuid")
+                    subject = latest.get("subject", "Loan Update")
+                    log(f"✅ Found email uuid: {uuid} (subject: {subject})")
+                    return uuid, subject
                 else:
                     log(f"⚠️ No emails found for {lead_email} in campaign {campaign_id or 'all'}")
             else:
                 error_text = r.text[:200] if r.text else "No error message"
                 log(f"❌ API Error {r.status_code}: {error_text}")
     except Exception as e:
-        log(f"⚠️ Exception fetching email_id: {str(e)}")
-    return None
+        log(f"⚠️ Exception fetching email uuid: {str(e)}")
+    return None, None
 
 # ───────── BUILD EMAIL HTML ─────────
 def build_html(choice, remaining, recipient_email: Optional[str] = None):
@@ -154,16 +156,25 @@ def build_html(choice, remaining, recipient_email: Optional[str] = None):
     """
 
 # ───────── SEND REPLY IN SAME THREAD ─────────
-async def reply(uuid, subject, html):
-    subject = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
+async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
+    """Send reply email via Instantly.ai API"""
+    # Ensure subject has "Re: " prefix if not present
+    reply_subject = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
+    
     async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(INSTANTLY_URL, json={
-            "reply_to_uuid":uuid,
-            "eaccount":INSTANTLY_EACCOUNT,
-            "subject":subject,
-            "body":{"html":html}
-        }, headers={"Authorization":f"Bearer {INSTANTLY_API_KEY}"})
-        if r.status_code > 299: log(f"❌ reply_failed {r.text}")
+        reply_json = {
+            "eaccount": eaccount,
+            "reply_to_uuid": reply_to_uuid,
+            "subject": reply_subject,
+            "body": {"html": html}
+        }
+        log(f"📤 Sending reply: uuid={reply_to_uuid}, subject={reply_subject}, eaccount={eaccount}")
+        r = await c.post(INSTANTLY_URL, json=reply_json, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
+        
+        if r.status_code > 299:
+            log(f"❌ REPLY_API_ERROR: Status {r.status_code}, Response: {r.text[:200]}")
+        else:
+            log(f"✅ REPLY_API_SUCCESS: Reply sent successfully (status {r.status_code})")
 
 # ========== WEBHOOK ==========
 app = FastAPI()
@@ -267,24 +278,22 @@ async def instantly_webhook(req: Request):
             choice = matching_click
             log(f"📧 EMAIL_MATCHING_COMPLETE: Using choice '{choice}' (matched via {matching_method}) for {recipient_key}")
             
-            # First, check if webhook payload contains email_id directly
-            email_id = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
+            # Get email_account and campaign_id from webhook payload
+            eaccount = payload.get("email_account") or INSTANTLY_EACCOUNT
+            campaign_id_val = campaign_id if campaign_id != "unknown" else None
             
-            # If not in payload, try to get from Instantly.ai API
-            if not email_id:
-                log(f"🔍 EMAIL_ID_LOOKUP: email_id not in webhook payload, trying API lookup...")
-                email_id = await find_email_id_for_lead(recipient, campaign_id if campaign_id != "unknown" else None)
-            else:
-                log(f"✅ EMAIL_ID_FOUND: Found email_id in webhook payload: {email_id}")
+            # Get email uuid and subject from Instantly.ai API
+            log(f"🔍 EMAIL_UUID_LOOKUP: Looking up email uuid for {recipient_key} (eaccount: {eaccount}, campaign: {campaign_id_val})")
+            email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val)
             
-            if email_id:
+            if email_uuid:
                 # Get remaining choices
                 remaining = [c for c in ALL if c != choice]
                 html = build_html(choice, remaining, recipient)
-                await reply(email_id, "Loan Update", html)
+                await reply(eaccount, email_uuid, original_subject, html)
                 log(f"✅ REPLY_SENT: Automatic reply sent for choice '{choice}' to {recipient_key} (matched via {matching_method})")
             else:
-                log(f"❌ REPLY_FAILED: Could not find email_id for {recipient_key}. Reply not sent.")
+                log(f"❌ REPLY_FAILED: Could not find email uuid for {recipient_key}. Reply not sent.")
                 log(f"💡 DEBUG: Webhook payload keys: {list(payload.keys())}")
         else:
             log(f"❌ EMAIL_MATCHING_NO_RESULT: No matching click found for webhook from {recipient_key}")
