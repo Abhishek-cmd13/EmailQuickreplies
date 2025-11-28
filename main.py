@@ -131,6 +131,30 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                     log(f"💡 DEBUG: API returned data type: {type(data)}")
                     log(f"💡 DEBUG: Response keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
                     log(f"💡 DEBUG: Response data: {json.dumps(data, indent=2)[:500]}")
+            elif r.status_code == 429:
+                error_text = r.text[:500] if r.text else "No error message"
+                log(f"⚠️ API_RATE_LIMITED: Status 429 - Too Many Requests. Error: {error_text}")
+                log(f"💡 RATE_LIMIT_INFO: Instantly.ai allows max 20 requests per minute. Waiting and retrying...")
+                # Wait 3 seconds and retry once
+                import asyncio
+                await asyncio.sleep(3)
+                log(f"🔄 API_RETRY: Retrying API call after rate limit delay...")
+                r = await c.get(url, params=params, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
+                log(f"📡 API_RESPONSE (retry): Status {r.status_code}")
+                if r.status_code == 200:
+                    data = r.json()
+                    emails = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    log(f"📧 API_RESULT (retry): Found {len(emails)} email(s) for {lead_email}")
+                    if emails:
+                        emails.sort(key=lambda x: x.get("timestamp_created", x.get("timestamp_email", "")), reverse=True)
+                        latest = emails[0]
+                        uuid = latest.get("id")
+                        subject = latest.get("subject", "Loan Update")
+                        log(f"✅ UUID_FOUND (retry): uuid={uuid}, subject={subject}")
+                        return uuid, subject
+                else:
+                    error_text = r.text[:500] if r.text else "No error message"
+                    log(f"❌ API_ERROR (retry): Status {r.status_code}, Error: {error_text}")
             else:
                 error_text = r.text[:500] if r.text else "No error message"
                 log(f"❌ API_ERROR: Status {r.status_code}, Error: {error_text}")
@@ -262,13 +286,14 @@ async def instantly_webhook(req: Request):
         
         # PRIMARY: Email-based matching
         if recipient_key:
-            email_click = RECENT_EMAIL_CLICKS.pop(recipient_key, None)
+            email_click = RECENT_EMAIL_CLICKS.get(recipient_key, None)
             if email_click:
                 matching_click = email_click.get("choice")
                 email_ts = email_click.get("timestamp")
                 age = (datetime.now() - email_ts).total_seconds() if email_ts else 0
                 matching_method = "EMAIL_BASED"
                 log(f"✅ EMAIL_MATCHING_SUCCESS: Matched via email for {recipient_key} → choice: {matching_click} (age {age:.1f}s)")
+                # Don't pop immediately - keep for duplicate webhook handling (TTL will clean it up)
             else:
                 log(f"⚠️ EMAIL_MATCHING_FAILED: No stored click found for email {recipient_key}")
 
@@ -294,11 +319,19 @@ async def instantly_webhook(req: Request):
             eaccount = payload.get("email_account") or INSTANTLY_EACCOUNT
             campaign_id_val = campaign_id if campaign_id != "unknown" else None
             
-            log(f"🔍 EMAIL_UUID_LOOKUP_START: recipient={recipient_key}, eaccount={eaccount}, campaign_id={campaign_id_val}")
-            log(f"💡 DEBUG: Full payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}'")
+            # First, check if webhook payload contains email_id/uuid directly (avoids API rate limits)
+            email_uuid = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
+            original_subject = payload.get("subject", "Loan Update")
             
-            # Get email uuid and subject from Instantly.ai API
-            email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val)
+            if email_uuid:
+                log(f"✅ EMAIL_UUID_FOUND_IN_PAYLOAD: Found email_uuid in webhook payload: {email_uuid}")
+            else:
+                log(f"🔍 EMAIL_UUID_LOOKUP_START: email_uuid not in payload, trying API lookup...")
+                log(f"🔍 EMAIL_UUID_LOOKUP_START: recipient={recipient_key}, eaccount={eaccount}, campaign_id={campaign_id_val}")
+                log(f"💡 DEBUG: Full payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}'")
+                
+                # Get email uuid and subject from Instantly.ai API (only if not in payload)
+                email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val)
             
             log(f"🔍 EMAIL_UUID_LOOKUP_RESULT: uuid={email_uuid}, subject={original_subject}")
             
