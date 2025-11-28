@@ -52,10 +52,8 @@ CHOICE_COPY = {
 # ───────── LOG BUFFER (UI readable) ─────────
 LOGS = deque(maxlen=800)
 
-# Store recent clicks keyed by email so we can match instantly via webhook
+# Store recent clicks keyed by email so we can match instantly via webhook (EMAIL-BASED ONLY)
 RECENT_EMAIL_CLICKS: Dict[str, Dict[str, Any]] = {}
-# Fallback click history (time-based) to support old links without email param
-RECENT_CLICKS = deque(maxlen=100)
 EMAIL_CLICK_TTL_SECONDS = 3600  # one hour safety window
 
 # Cache UUID lookups to avoid excessive API calls (rate limit: 20/min)
@@ -783,23 +781,13 @@ async def process_webhook_logic(payload: Dict[str, Any]):
                         # Return early - click handler will process this webhook
                         return
 
-            # FALLBACK: Time-based matching (only if email-based failed and we have email_id in payload)
+            # EMAIL-BASED MATCHING ONLY (time-based matching removed)
             # This is less deterministic, so we only use it if we have UUID validation
             if not matching_click:
                 email_uuid_from_payload = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
                 if email_uuid_from_payload:
-                    # If we have UUID, we can use time-based matching more safely
-                    now = datetime.now()
-                    for click_time, choice_val, ip in reversed(list(RECENT_CLICKS)):
-                        time_diff = (now - click_time).total_seconds()
-                        if time_diff < 30:  # Shorter window (30s) for time-based fallback
-                            matching_click = choice_val
-                            matching_method = "TIME_BASED_FALLBACK_WITH_UUID"
-                            log(f"✅ EMAIL_MATCHING_FALLBACK: Matched via time-based fallback → choice: {choice_val} (from {time_diff:.1f}s ago, UUID available)")
-                            break
-                    
-                    if not matching_click:
-                        log(f"❌ EMAIL_MATCHING_FAILED: No click found for email {recipient_key} (no email match, no time-based fallback)")
+                    # UUID available but no email match - log but don't use time-based matching
+                    log(f"❌ EMAIL_MATCHING_FAILED: No stored click found for email {recipient_key} (UUID available from webhook but no email match)")
             
             if matching_click:
                 choice = matching_click
@@ -936,8 +924,8 @@ async def handle_instantly_tracking(tracking_path: str, request: Request):
         choice = choice_params.get("c", choice_params.get("choice", [None]))[0] or "unknown"
         
         if choice != "unknown":
-            RECENT_CLICKS.append((datetime.now(), choice, request.client.host if request.client else "unknown"))
-            log(f"💾 Stored choice {choice} from tracking redirect")
+            # Note: Time-based matching removed - only email-based matching is used
+            log(f"💾 Tracking redirect: Choice {choice} detected (email-based matching required)")
         
         # Redirect to the original destination
         from fastapi.responses import RedirectResponse
@@ -961,12 +949,11 @@ async def qr_click(request: Request):
     
     log(f"🔗 LINK_CLICKED (legacy): /qr?c={choice} | Params: {query_params} | IP: {client_ip}")
     
-    # Store the click with timestamp - webhook will match within 60 seconds
+    # Note: Time-based matching removed - email parameter required for matching
     if choice != "unknown":
-        RECENT_CLICKS.append((datetime.now(), choice, client_ip))
-        log(f"💾 Stored choice {choice} - waiting for webhook (will match within 60s)")
+        log(f"💾 Legacy click detected: Choice {choice} (email-based matching required)")
     
-    log(f"ℹ️ Instantly.ai will send webhook → automatic reply will be sent")
+    log(f"ℹ️ Instantly.ai will send webhook → automatic reply will be sent (requires email match)")
     return PlainTextResponse("",status_code=204)  # invisible
 
 # ========== LOGS UI ==========
@@ -1348,14 +1335,14 @@ async def link_click(path_choice: str, request: Request):
             or query_params.get("recipient")
         )
         
-        # Store the click with timestamp - webhook will match within 60 seconds
+        # Store the click - EMAIL-BASED MATCHING ONLY (time-based matching removed)
         if email_param:
             store_email_click(email_param, choice, client_ip)
             log(f"💾 EMAIL_CLICK_STORED: Choice '{choice}' stored for email '{email_param}' - ready for email-based matching")
+            log(f"⏳ EMAIL_CLICK_WAITING: Waiting for Instantly.ai webhook to trigger automatic reply")
         else:
-            log(f"⚠️ EMAIL_CLICK_NO_EMAIL: Choice '{choice}' stored without email parameter - will use time-based fallback")
-        RECENT_CLICKS.append((datetime.now(), choice, client_ip))
-        log(f"⏳ EMAIL_CLICK_WAITING: Waiting for Instantly.ai webhook to trigger automatic reply")
+            log(f"⚠️ EMAIL_CLICK_NO_EMAIL: Choice '{choice}' detected but NO email parameter - REPLY WILL NOT BE SENT (email-based matching only)")
+            log(f"⚠️ EMAIL_CLICK_REQUIRED: Links must include ?email={{email}} parameter for replies to work")
     # Don't log unknown paths - just return silently
     
     return PlainTextResponse("",status_code=204)  # invisible
