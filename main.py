@@ -122,12 +122,24 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                     latest = emails[0]
                     # API returns "id" field as the uuid
                     uuid = latest.get("id")
-                    subject = latest.get("subject") or latest.get("email_subject") or "Loan Update"
-                    if not subject or not subject.strip():
-                        subject = "Loan Update"
-                    log(f"✅ UUID_FOUND: uuid={uuid}, subject={subject}")
+                    # Try multiple possible subject fields from Instantly.ai API
+                    subject = (latest.get("subject") or 
+                              latest.get("email_subject") or 
+                              latest.get("subject_line") or
+                              latest.get("title") or
+                              "")
+                    
+                    # Log all available fields for debugging
                     log(f"💡 DEBUG: Latest email keys: {list(latest.keys())}")
-                    log(f"💡 DEBUG: Subject from API: '{latest.get('subject')}' or '{latest.get('email_subject')}'")
+                    log(f"💡 DEBUG: Subject fields - subject='{latest.get('subject')}', email_subject='{latest.get('email_subject')}', subject_line='{latest.get('subject_line')}', title='{latest.get('title')}'")
+                    
+                    if not subject or not subject.strip():
+                        log(f"⚠️ WARNING: Subject is empty in API response - this will cause threading issues")
+                        log(f"💡 DEBUG: Full email object (first 500 chars): {json.dumps(latest, indent=2)[:500]}")
+                        subject = "Loan Update"  # Fallback - but this is not ideal
+                    else:
+                        log(f"✅ UUID_FOUND: uuid={uuid}, subject={subject}")
+                    
                     return uuid, subject
                 else:
                     log(f"⚠️ UUID_NOT_FOUND: No emails found for {lead_email}")
@@ -196,12 +208,14 @@ def build_html(choice, remaining, recipient_email: Optional[str] = None):
 
 # ───────── SEND REPLY IN SAME THREAD ─────────
 async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
-    """Send reply email via Instantly.ai API"""
-    # Handle empty subject - use default if missing
+    """Send reply email via Instantly.ai API - uses original email subject to maintain thread"""
+    # Use the original subject from the email we're replying to (for thread continuity)
+    # Don't modify it - Instantly.ai will handle threading via reply_to_uuid
+    # If subject is empty, we shouldn't use a default - we need the actual original subject
     if not subject or not subject.strip():
-        subject = "Loan Update"
-    # Ensure subject has "Re: " prefix if not present
-    reply_subject = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
+        log(f"⚠️ REPLY_WARNING: Empty subject provided - this may cause threading issues")
+        # Try to get subject from API by UUID if we have it
+        subject = "Loan Update"  # Fallback only if absolutely necessary
     
     async with httpx.AsyncClient(timeout=15) as c:
         reply_json = {
