@@ -875,16 +875,8 @@ async def process_webhook_logic(payload: Dict[str, Any]):
 @app.post("/webhook/instantly")
 async def instantly_webhook(req: Request, bg: BackgroundTasks):
     """Fast webhook endpoint - returns immediately, processes in background"""
-    # Log webhook reception IMMEDIATELY (before background processing)
-    client_ip = req.client.host if req.client else "unknown"
-    log(f"🔔 WEBHOOK_ENDPOINT_CALLED: POST /webhook/instantly from IP: {client_ip}")
-    
     try:
         payload = await req.json()
-        # Log full payload immediately (before background task)
-        log(f"📥 WEBHOOK_PAYLOAD_RECEIVED: {json.dumps(payload, indent=2)}")
-        log(f"📋 WEBHOOK_EVENT_TYPE: {payload.get('event_type', 'unknown')}")
-        log(f"👤 WEBHOOK_LEAD_EMAIL: {payload.get('lead_email', 'unknown')}")
     except Exception as e:
         # Fast error handling - don't block
         body = await req.body()
@@ -1000,6 +992,8 @@ def logs_get_requests():
             "WEBHOOK_PAYLOAD",  # Webhook payload received
             "WEBHOOK_EVENT_TYPE",  # Event type from webhook
             "WEBHOOK_LEAD_EMAIL",  # Lead email from webhook
+            "WEBHOOK_EMAIL_ACCOUNT",  # Email account from webhook
+            "WEBHOOK_CAMPAIGN_ID",  # Campaign ID from webhook
             "WEBHOOK_PROCESSING",  # Webhook processing exception
             "link_clicked",  # Event type from Instantly.ai
             "EMAIL_ID",
