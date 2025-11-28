@@ -101,15 +101,16 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
             if campaign_id:
                 params["campaign_id"] = campaign_id
             
-            log(f"🔍 Looking up email uuid for {lead_email} (eaccount: {eaccount}, campaign: {campaign_id or 'all'})")
+            log(f"🔍 API_CALL_START: GET {url}")
+            log(f"📋 API_PARAMS: {params}")
             r = await c.get(url, params=params, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
             
-            log(f"📡 API Response: Status {r.status_code}")
+            log(f"📡 API_RESPONSE: Status {r.status_code}")
             
             if r.status_code == 200:
                 data = r.json()
                 emails = data.get("emails", [])
-                log(f"📧 Found {len(emails)} email(s) for {lead_email}")
+                log(f"📧 API_RESULT: Found {len(emails)} email(s) for {lead_email}")
                 
                 if emails:
                     # Sort by sent_at (most recent first)
@@ -117,15 +118,20 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                     latest = emails[0]
                     uuid = latest.get("uuid")
                     subject = latest.get("subject", "Loan Update")
-                    log(f"✅ Found email uuid: {uuid} (subject: {subject})")
+                    log(f"✅ UUID_FOUND: uuid={uuid}, subject={subject}")
+                    log(f"💡 DEBUG: Latest email keys: {list(latest.keys())}")
                     return uuid, subject
                 else:
-                    log(f"⚠️ No emails found for {lead_email} in campaign {campaign_id or 'all'}")
+                    log(f"⚠️ UUID_NOT_FOUND: No emails found for {lead_email}")
+                    log(f"💡 DEBUG: API returned data keys: {list(data.keys())}")
+                    log(f"💡 DEBUG: Response data: {json.dumps(data, indent=2)[:500]}")
             else:
-                error_text = r.text[:200] if r.text else "No error message"
-                log(f"❌ API Error {r.status_code}: {error_text}")
+                error_text = r.text[:500] if r.text else "No error message"
+                log(f"❌ API_ERROR: Status {r.status_code}, Error: {error_text}")
     except Exception as e:
-        log(f"⚠️ Exception fetching email uuid: {str(e)}")
+        import traceback
+        log(f"❌ EXCEPTION: {str(e)}")
+        log(f"💡 TRACEBACK: {traceback.format_exc()[:500]}")
     return None, None
 
 # ───────── BUILD EMAIL HTML ─────────
@@ -282,9 +288,13 @@ async def instantly_webhook(req: Request):
             eaccount = payload.get("email_account") or INSTANTLY_EACCOUNT
             campaign_id_val = campaign_id if campaign_id != "unknown" else None
             
+            log(f"🔍 EMAIL_UUID_LOOKUP_START: recipient={recipient_key}, eaccount={eaccount}, campaign_id={campaign_id_val}")
+            log(f"💡 DEBUG: Full payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}'")
+            
             # Get email uuid and subject from Instantly.ai API
-            log(f"🔍 EMAIL_UUID_LOOKUP: Looking up email uuid for {recipient_key} (eaccount: {eaccount}, campaign: {campaign_id_val})")
             email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val)
+            
+            log(f"🔍 EMAIL_UUID_LOOKUP_RESULT: uuid={email_uuid}, subject={original_subject}")
             
             if email_uuid:
                 # Get remaining choices
@@ -294,7 +304,8 @@ async def instantly_webhook(req: Request):
                 log(f"✅ REPLY_SENT: Automatic reply sent for choice '{choice}' to {recipient_key} (matched via {matching_method})")
             else:
                 log(f"❌ REPLY_FAILED: Could not find email uuid for {recipient_key}. Reply not sent.")
-                log(f"💡 DEBUG: Webhook payload keys: {list(payload.keys())}")
+                log(f"💡 DEBUG: Webhook payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}', recipient='{recipient}'")
+                log(f"💡 DEBUG: Using eaccount='{eaccount}', campaign_id_val='{campaign_id_val}'")
         else:
             log(f"❌ EMAIL_MATCHING_NO_RESULT: No matching click found for webhook from {recipient_key}")
     
@@ -379,8 +390,15 @@ def logs_get_requests():
             "REPLY_FAILED",
             "WEBHOOK",
             "EMAIL_ID",
+            "EMAIL_UUID",
+            "UUID",
+            "API_CALL",
+            "API_RESPONSE",
+            "API_RESULT",
+            "API_ERROR",
             "EMAIL_CLICK_STORED",
-            "EMAIL_CLICK_WAITING"
+            "EMAIL_CLICK_WAITING",
+            "DEBUG"
         ])
     ]
     return list(email_logs[-100:])  # Last 100 email-related logs
