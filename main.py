@@ -439,8 +439,8 @@ def build_html(choice, remaining, recipient_email: Optional[str] = None):
     """
 
 # ───────── SEND REPLY IN SAME THREAD ─────────
-async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
-    """Send reply email via Instantly.ai API - uses original email subject to maintain thread"""
+async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str) -> bool:
+    """Send reply email via Instantly.ai API - returns True if successful, False otherwise"""
     # Use the original subject from the email we're replying to (for thread continuity)
     # Don't modify it - Instantly.ai will handle threading via reply_to_uuid
     # If subject is empty, we shouldn't use a default - we need the actual original subject
@@ -456,46 +456,63 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
     else:
         reply_subject = subject  # Already has "Re:" prefix
     
+    # Validate inputs
+    if not reply_to_uuid or not reply_to_uuid.strip():
+        log(f"❌ REPLY_FAILED: Invalid reply_to_uuid (empty or None)")
+        return False
+    
+    if not eaccount or not eaccount.strip():
+        log(f"❌ REPLY_FAILED: Invalid eaccount (empty or None)")
+        return False
+    
     # Apply rate limiting to reply API calls as well
     await wait_for_rate_limit()
     
-    async with httpx.AsyncClient(timeout=15) as c:
-        reply_json = {
-            "eaccount": eaccount,
-            "reply_to_uuid": reply_to_uuid,
-            "subject": reply_subject,
-            "body": {"html": html}
-        }
-        log(f"📤 REPLY_PAYLOAD: uuid={reply_to_uuid}, subject={reply_subject}, eaccount={eaccount}")
-        log(f"💡 REPLY_THREADING: Original subject='{subject}' → Reply subject='{reply_subject}' (for thread continuity)")
-        log(f"📤 REPLY_PAYLOAD_FULL: {json.dumps(reply_json, indent=2)[:500]}")
-        r = await c.post(INSTANTLY_URL, json=reply_json, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
-        
-        log(f"📡 REPLY_API_RESPONSE: Status {r.status_code}")
-        
-        if r.status_code == 429:
-            error_response = r.text[:500] if r.text else "No error message"
-            log(f"⚠️ REPLY_RATE_LIMITED: Status 429 - Too Many Requests. Response: {error_response}")
-            log(f"💡 REPLY_RETRY: Will retry after rate limit delay")
-            # Wait and retry once
-            await asyncio.sleep(5)
-            await wait_for_rate_limit()
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            reply_json = {
+                "eaccount": eaccount,
+                "reply_to_uuid": reply_to_uuid,
+                "subject": reply_subject,
+                "body": {"html": html}
+            }
+            log(f"📤 REPLY_PAYLOAD: uuid={reply_to_uuid}, subject={reply_subject}, eaccount={eaccount}")
+            log(f"💡 REPLY_THREADING: Original subject='{subject}' → Reply subject='{reply_subject}' (for thread continuity)")
+            log(f"📤 REPLY_PAYLOAD_FULL: {json.dumps(reply_json, indent=2)[:500]}")
             r = await c.post(INSTANTLY_URL, json=reply_json, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
-            log(f"📡 REPLY_API_RESPONSE (retry): Status {r.status_code}")
-        
-        if r.status_code > 299:
-            error_response = r.text[:500] if r.text else "No error message"
-            log(f"❌ REPLY_API_ERROR: Status {r.status_code}, Response: {error_response}")
-            log(f"💡 REPLY_DEBUG: Request payload was: {json.dumps(reply_json, indent=2)[:500]}")
-        else:
-            response_text = r.text[:500] if r.text else "No response body"
-            log(f"✅ REPLY_API_SUCCESS: Status {r.status_code}, Response: {response_text}")
-            # Log full response for debugging
-            try:
-                response_json = r.json()
-                log(f"💡 REPLY_RESPONSE_DETAILS: {json.dumps(response_json, indent=2)[:500]}")
-            except:
-                log(f"💡 REPLY_RESPONSE_TEXT: {response_text}")
+            
+            log(f"📡 REPLY_API_RESPONSE: Status {r.status_code}")
+            
+            if r.status_code == 429:
+                error_response = r.text[:500] if r.text else "No error message"
+                log(f"⚠️ REPLY_RATE_LIMITED: Status 429 - Too Many Requests. Response: {error_response}")
+                log(f"💡 REPLY_RETRY: Will retry after rate limit delay")
+                # Wait and retry once
+                await asyncio.sleep(5)
+                await wait_for_rate_limit()
+                r = await c.post(INSTANTLY_URL, json=reply_json, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
+                log(f"📡 REPLY_API_RESPONSE (retry): Status {r.status_code}")
+            
+            if r.status_code > 299:
+                error_response = r.text[:1000] if r.text else "No error message"
+                log(f"❌ REPLY_API_ERROR: Status {r.status_code}, Response: {error_response}")
+                log(f"💡 REPLY_DEBUG: Request payload was: {json.dumps(reply_json, indent=2)[:500]}")
+                return False
+            else:
+                response_text = r.text[:1000] if r.text else "No response body"
+                log(f"✅ REPLY_API_SUCCESS: Status {r.status_code}, Response: {response_text}")
+                # Log full response for debugging
+                try:
+                    response_json = r.json()
+                    log(f"💡 REPLY_RESPONSE_DETAILS: {json.dumps(response_json, indent=2)[:500]}")
+                except:
+                    log(f"💡 REPLY_RESPONSE_TEXT: {response_text}")
+                return True
+    except Exception as e:
+        import traceback
+        log(f"❌ REPLY_EXCEPTION: {str(e)}")
+        log(f"💡 REPLY_TRACEBACK: {traceback.format_exc()[:500]}")
+        return False
 
 # ========== WEBHOOK ==========
 app = FastAPI()
@@ -692,8 +709,12 @@ async def instantly_webhook(req: Request):
                 # Get remaining choices
                 remaining = [c for c in ALL if c != choice]
                 html = build_html(choice, remaining, recipient)
-                await reply(eaccount, email_uuid, original_subject, html)
-                log(f"✅ REPLY_SENT: Automatic reply sent for choice '{choice}' to {recipient_key} (matched via {matching_method})")
+                # Call reply and check if it actually succeeded
+                reply_success = await reply(eaccount, email_uuid, original_subject, html)
+                if reply_success:
+                    log(f"✅ REPLY_SENT: Automatic reply sent successfully for choice '{choice}' to {recipient_key} (matched via {matching_method})")
+                else:
+                    log(f"❌ REPLY_FAILED: Reply API call failed for choice '{choice}' to {recipient_key} (matched via {matching_method}) - check logs above for error details")
             else:
                 log(f"❌ REPLY_FAILED: Could not find email uuid for {recipient_key}. Reply not sent.")
                 log(f"💡 DEBUG: Webhook payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}', recipient='{recipient}'")
