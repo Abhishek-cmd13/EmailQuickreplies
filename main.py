@@ -57,6 +57,17 @@ RECENT_EMAIL_CLICKS: Dict[str, Dict[str, Any]] = {}
 RECENT_CLICKS = deque(maxlen=100)
 EMAIL_CLICK_TTL_SECONDS = 3600  # one hour safety window
 
+# Paths to exclude from email click tracking logs
+NON_EMAIL_PATHS = {"/logs", "/status", "/test", "/qr", "/favicon.ico", "/lt", "/webhook"}
+
+def is_email_click_path(path: str) -> bool:
+    """Check if path is an email click tracking path"""
+    path_lower = path.lower().strip("/")
+    if path in NON_EMAIL_PATHS or any(path.startswith(excluded) for excluded in NON_EMAIL_PATHS):
+        return False
+    # Check if it's one of our choice paths
+    return path_lower in PATH_TO_CHOICE or any(path.startswith(f"/{choice}") for choice in PATH_TO_CHOICE.keys())
+
 def log(x): LOGS.append({"t":datetime.now().isoformat(),"m":x}); print(x)
 
 def store_email_click(email: str, choice: str, client_ip: str) -> None:
@@ -67,14 +78,18 @@ def store_email_click(email: str, choice: str, client_ip: str) -> None:
     if not normalized:
         return
     now = datetime.now()
-    RECENT_EMAIL_CLICKS[normalized] = {"choice": choice, "timestamp": now}
-    log(f"📧 Stored choice {choice} for email {normalized} (IP: {client_ip})")
+    RECENT_EMAIL_CLICKS[normalized] = {"choice": choice, "timestamp": now, "ip": client_ip}
+    log(f"📧 EMAIL_STORED: Email '{normalized}' → Choice '{choice}' stored (IP: {client_ip})")
     # Prune stale entries
     cutoff_delta = EMAIL_CLICK_TTL_SECONDS
+    pruned_count = 0
     for key, data in list(RECENT_EMAIL_CLICKS.items()):
         ts = data.get("timestamp")
         if ts and (now - ts).total_seconds() > cutoff_delta:
             del RECENT_EMAIL_CLICKS[key]
+            pruned_count += 1
+    if pruned_count > 0:
+        log(f"🧹 EMAIL_STORAGE_CLEANUP: Pruned {pruned_count} stale email entries")
 
 async def find_email_id_for_lead(lead_email: str, campaign_id: str = None):
     """Try to find email_id for a lead using Instantly.ai API"""
@@ -86,16 +101,29 @@ async def find_email_id_for_lead(lead_email: str, campaign_id: str = None):
             if campaign_id:
                 params["campaign_id"] = campaign_id
             
+            log(f"🔍 Looking up email_id for {lead_email} (campaign: {campaign_id or 'all'})")
             r = await c.get(url, params=params, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
+            
+            log(f"📡 API Response: Status {r.status_code}")
+            
             if r.status_code == 200:
                 data = r.json()
                 emails = data.get("emails", [])
+                log(f"📧 Found {len(emails)} email(s) for {lead_email}")
+                
                 if emails:
                     # Get most recent email
                     latest = sorted(emails, key=lambda x: x.get("sent_at", ""), reverse=True)[0]
-                    return latest.get("id") or latest.get("email_id")
+                    email_id = latest.get("id") or latest.get("email_id")
+                    log(f"✅ Found email_id: {email_id}")
+                    return email_id
+                else:
+                    log(f"⚠️ No emails found for {lead_email} in campaign {campaign_id or 'all'}")
+            else:
+                error_text = r.text[:200] if r.text else "No error message"
+                log(f"❌ API Error {r.status_code}: {error_text}")
     except Exception as e:
-        log(f"⚠️ Could not fetch email_id: {str(e)}")
+        log(f"⚠️ Exception fetching email_id: {str(e)}")
     return None
 
 # ───────── BUILD EMAIL HTML ─────────
@@ -140,27 +168,31 @@ async def reply(uuid, subject, html):
 # ========== WEBHOOK ==========
 app = FastAPI()
 
-# Middleware to log ALL incoming requests
+# Middleware to log ONLY email click tracking GET requests
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     host = request.headers.get("host", "unknown")
     client_ip = request.client.host if request.client else "unknown"
     
-    # Enhanced logging for GET requests (especially click tracking)
-    if request.method == "GET":
+    # Only log GET requests for email click tracking paths
+    if request.method == "GET" and is_email_click_path(request.url.path):
         query_params = dict(request.query_params)
         query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()]) if query_params else ""
-        log(f"🌐 REQUEST: {request.method} {request.url.path}{query_str} | Host: {host} | Client: {client_ip}")
-    else:
-        log(f"🌐 REQUEST: {request.method} {request.url.path} | Host: {host} | Client: {client_ip}")
+        log(f"🌐 EMAIL_CLICK_REQUEST: GET {request.url.path}{query_str} | Host: {host} | Client: {client_ip}")
     
-    # Log headers for webhook requests
+    # Always log webhook requests
     if request.url.path == "/webhook/instantly":
         headers_dict = dict(request.headers)
-        log(f"📋 HEADERS: {json.dumps(headers_dict, indent=2)}")
+        log(f"📋 WEBHOOK_HEADERS: {json.dumps(headers_dict, indent=2)}")
     
     response = await call_next(request)
-    log(f"📤 RESPONSE: {request.method} {request.url.path} -> {response.status_code}")
+    
+    # Only log responses for email click paths
+    if request.method == "GET" and is_email_click_path(request.url.path):
+        log(f"📤 EMAIL_CLICK_RESPONSE: GET {request.url.path} -> {response.status_code}")
+    elif request.url.path == "/webhook/instantly":
+        log(f"📤 WEBHOOK_RESPONSE: POST {request.url.path} -> {response.status_code}")
+    
     return response
 
 @app.post("/webhook/instantly")
@@ -200,41 +232,62 @@ async def instantly_webhook(req: Request):
         log(f"✅ LINK_CLICK_WEBHOOK_RECEIVED from Instantly.ai")
 
         matching_click = None
+        matching_method = None
         recipient_key = (recipient or "").strip().lower()
+        
+        log(f"🔍 EMAIL_MATCHING_START: Looking for click for email: {recipient_key}")
+        
+        # PRIMARY: Email-based matching
         if recipient_key:
             email_click = RECENT_EMAIL_CLICKS.pop(recipient_key, None)
             if email_click:
                 matching_click = email_click.get("choice")
                 email_ts = email_click.get("timestamp")
                 age = (datetime.now() - email_ts).total_seconds() if email_ts else 0
-                log(f"📌 Matched via email: {recipient_key} (age {age:.1f}s)")
+                matching_method = "EMAIL_BASED"
+                log(f"✅ EMAIL_MATCHING_SUCCESS: Matched via email for {recipient_key} → choice: {matching_click} (age {age:.1f}s)")
+            else:
+                log(f"⚠️ EMAIL_MATCHING_FAILED: No stored click found for email {recipient_key}")
 
-        # Fallback: Find most recent click within last 60 seconds
+        # FALLBACK: Time-based matching
         if not matching_click:
             now = datetime.now()
             for click_time, choice_val, ip in reversed(list(RECENT_CLICKS)):
                 time_diff = (now - click_time).total_seconds()
                 if time_diff < 60:  # Within last 60 seconds
                     matching_click = choice_val
-                    log(f"📌 Matched with recent click (fallback): {choice_val} (from {time_diff:.1f}s ago)")
+                    matching_method = "TIME_BASED_FALLBACK"
+                    log(f"✅ EMAIL_MATCHING_FALLBACK: Matched via time-based fallback → choice: {choice_val} (from {time_diff:.1f}s ago)")
                     break
+            
+            if not matching_click:
+                log(f"❌ EMAIL_MATCHING_FAILED: No click found for email {recipient_key} (no email match, no time-based fallback)")
         
         if matching_click:
             choice = matching_click
+            log(f"📧 EMAIL_MATCHING_COMPLETE: Using choice '{choice}' (matched via {matching_method}) for {recipient_key}")
             
-            # Try to get email_id from Instantly.ai API
-            email_id = await find_email_id_for_lead(recipient, campaign_id)
+            # First, check if webhook payload contains email_id directly
+            email_id = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
+            
+            # If not in payload, try to get from Instantly.ai API
+            if not email_id:
+                log(f"🔍 EMAIL_ID_LOOKUP: email_id not in webhook payload, trying API lookup...")
+                email_id = await find_email_id_for_lead(recipient, campaign_id if campaign_id != "unknown" else None)
+            else:
+                log(f"✅ EMAIL_ID_FOUND: Found email_id in webhook payload: {email_id}")
             
             if email_id:
                 # Get remaining choices
                 remaining = [c for c in ALL if c != choice]
                 html = build_html(choice, remaining, recipient)
                 await reply(email_id, "Loan Update", html)
-                log(f"✅ Reply sent for choice: {choice} to {recipient}")
+                log(f"✅ REPLY_SENT: Automatic reply sent for choice '{choice}' to {recipient_key} (matched via {matching_method})")
             else:
-                log(f"⚠️ Could not find email_id for {recipient}. Reply not sent.")
+                log(f"❌ REPLY_FAILED: Could not find email_id for {recipient_key}. Reply not sent.")
+                log(f"💡 DEBUG: Webhook payload keys: {list(payload.keys())}")
         else:
-            log(f"⚠️ No recent click found (via email or fallback). Reply not sent.")
+            log(f"❌ EMAIL_MATCHING_NO_RESULT: No matching click found for webhook from {recipient_key}")
     
     return {"ok":True}
 
@@ -301,15 +354,22 @@ def logs():
 
 @app.get("/logs/get-requests")
 def logs_get_requests():
-    """Filter logs to show only GET requests (click tracking)"""
-    # Filter GET requests but exclude log endpoints and status endpoints
-    exclude_paths = ["/logs", "/status", "/test"]
-    get_logs = [
+    """Filter logs to show only email click tracking GET requests"""
+    # Only show email click tracking requests and related events
+    email_logs = [
         log for log in LOGS 
-        if "REQUEST: GET" in log.get("m", "") 
-        and not any(excluded in log.get("m", "") for excluded in exclude_paths)
+        if any(keyword in log.get("m", "") for keyword in [
+            "EMAIL_CLICK_REQUEST",
+            "EMAIL_CLICK_RESPONSE", 
+            "LINK_CLICKED",
+            "EMAIL_MATCHING",
+            "Stored choice",
+            "Matched",
+            "REPLY_SENT",
+            "REPLY_FAILED"
+        ])
     ]
-    return list(get_logs[-100:])  # Last 100 GET requests
+    return list(email_logs[-100:])  # Last 100 email-related logs
 
 @app.get("/logs/live")
 def logs_live_html():
@@ -570,11 +630,12 @@ async def link_click(path_choice: str, request: Request):
     if choice != "unknown":
         if email_param:
             store_email_click(email_param, choice, client_ip)
+            log(f"💾 EMAIL_CLICK_STORED: Choice '{choice}' stored for email '{email_param}' - ready for email-based matching")
+        else:
+            log(f"⚠️ EMAIL_CLICK_NO_EMAIL: Choice '{choice}' stored without email parameter - will use time-based fallback")
         RECENT_CLICKS.append((datetime.now(), choice, client_ip))
-        log(f"💾 Stored choice {choice} - waiting for webhook (will match within 60s)")
+        log(f"⏳ EMAIL_CLICK_WAITING: Waiting for Instantly.ai webhook to trigger automatic reply")
     else:
-        log(f"⚠️ Unknown path choice: {path_choice}")
-    
-    log(f"ℹ️ Instantly.ai will send webhook → automatic reply will be sent")
+        log(f"⚠️ EMAIL_CLICK_UNKNOWN: Unknown path choice: {path_choice} - not a valid email click")
     return PlainTextResponse("",status_code=204)  # invisible
 
