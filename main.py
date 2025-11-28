@@ -57,6 +57,11 @@ RECENT_EMAIL_CLICKS: Dict[str, Dict[str, Any]] = {}
 RECENT_CLICKS = deque(maxlen=100)
 EMAIL_CLICK_TTL_SECONDS = 3600  # one hour safety window
 
+# Cache UUID lookups to avoid excessive API calls (rate limit: 20/min)
+# Key: (email, eaccount, campaign_id) -> {uuid, subject, timestamp}
+UUID_CACHE: Dict[str, Dict[str, Any]] = {}
+UUID_CACHE_TTL_SECONDS = 3600  # Cache UUIDs for 1 hour
+
 # Paths to exclude from email click tracking logs
 NON_EMAIL_PATHS = {"/logs", "/status", "/test", "/qr", "/favicon.ico", "/lt", "/webhook", "/robots.txt", "/.well-known"}
 
@@ -140,6 +145,14 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                     else:
                         log(f"✅ UUID_FOUND: uuid={uuid}, subject={subject}")
                     
+                    # Cache the UUID to avoid future API calls
+                    UUID_CACHE[cache_key] = {
+                        "uuid": uuid,
+                        "subject": subject,
+                        "timestamp": datetime.now()
+                    }
+                    log(f"💾 UUID_CACHED: Stored UUID for {lead_email} (cache key: {cache_key[:50]}...)")
+                    
                     return uuid, subject
                 else:
                     log(f"⚠️ UUID_NOT_FOUND: No emails found for {lead_email}")
@@ -166,6 +179,15 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                         uuid = latest.get("id")
                         subject = latest.get("subject", "Loan Update")
                         log(f"✅ UUID_FOUND (retry): uuid={uuid}, subject={subject}")
+                        
+                        # Cache the UUID from retry as well
+                        UUID_CACHE[cache_key] = {
+                            "uuid": uuid,
+                            "subject": subject,
+                            "timestamp": datetime.now()
+                        }
+                        log(f"💾 UUID_CACHED (retry): Stored UUID for {lead_email}")
+                        
                         return uuid, subject
                 else:
                     error_text = r.text[:500] if r.text else "No error message"
