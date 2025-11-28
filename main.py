@@ -6,7 +6,7 @@ from urllib.parse import quote_plus
 import asyncio
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
 
@@ -538,10 +538,10 @@ async def log_requests(request: Request, call_next):
         query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()]) if query_params else ""
         log(f"🌐 EMAIL_CLICK_REQUEST: GET {request.url.path}{query_str} | Host: {host} | Client: {client_ip}")
     
-    # Always log webhook requests
+    # Lightweight logging for webhook (avoid heavy JSON dumps in request cycle)
     if request.url.path == "/webhook/instantly":
-        headers_dict = dict(request.headers)
-        log(f"📋 WEBHOOK_HEADERS: {json.dumps(headers_dict, indent=2)}")
+        # Just log basic info - full payload logged in background
+        log(f"📋 WEBHOOK_RECEIVED: {request.method} {request.url.path}")
     
     response = await call_next(request)
     
@@ -549,180 +549,198 @@ async def log_requests(request: Request, call_next):
     if request.method == "GET" and is_email_click_path(request.url.path):
         log(f"📤 EMAIL_CLICK_RESPONSE: GET {request.url.path} -> {response.status_code}")
     elif request.url.path == "/webhook/instantly":
-        log(f"📤 WEBHOOK_RESPONSE: POST {request.url.path} -> {response.status_code}")
+        # Fast response logging
+        log(f"⚡ WEBHOOK_RESPONSE: {response.status_code} (processed in background)")
     
     return response
 
+async def process_webhook_logic(payload: Dict[str, Any]):
+    """Background task: Process webhook payload - matching, UUID lookup, reply sending"""
+    try:
+        # Log detailed webhook information (handling Instantly.ai actual payload structure)
+        event_type = payload.get("event_type") or payload.get("event") or payload.get("type") or "unknown"
+        recipient = payload.get("lead_email") or payload.get("email") or payload.get("recipient") or "unknown"
+        campaign_id = payload.get("campaign_id") or "unknown"
+        campaign_name = payload.get("campaign_name") or "unknown"
+        workspace = payload.get("workspace") or "unknown"
+        step = payload.get("step") or "unknown"
+        email_account = payload.get("email_account") or "unknown"
+        
+        log(f"📥 WEBHOOK_EVENT_PROCESSING: {event_type}")
+        log(f"   👤 Lead Email: {recipient}")
+        log(f"   📧 Email Account: {email_account}")
+        log(f"   📋 Campaign: {campaign_name} ({campaign_id})")
+        log(f"   🔢 Step: {step} | Workspace: {workspace}")
+        
+        # Check if this is a click event - send automatic reply
+        if "click" in event_type.lower():
+            log(f"✅ LINK_CLICK_WEBHOOK_RECEIVED from Instantly.ai")
+
+            matching_click = None
+            matching_method = None
+            recipient_key = (recipient or "").strip().lower()
+            
+            log(f"🔍 EMAIL_MATCHING_START: Looking for click for email: {recipient_key}")
+            
+            # PRIMARY: Email-based matching
+            if recipient_key:
+                # Debug: Log all stored emails
+                log(f"💡 DEBUG: RECENT_EMAIL_CLICKS keys: {list(RECENT_EMAIL_CLICKS.keys())}")
+                log(f"💡 DEBUG: Looking for key: '{recipient_key}' (type: {type(recipient_key)})")
+                
+                email_click = RECENT_EMAIL_CLICKS.get(recipient_key, None)
+                if email_click:
+                    matching_click = email_click.get("choice")
+                    email_ts = email_click.get("timestamp")
+                    age = (datetime.now() - email_ts).total_seconds() if email_ts else 0
+                    matching_method = "EMAIL_BASED"
+                    log(f"✅ EMAIL_MATCHING_SUCCESS: Matched via email for {recipient_key} → choice: {matching_click} (age {age:.1f}s)")
+                    # Don't pop immediately - keep for duplicate webhook handling (TTL will clean it up)
+                else:
+                    log(f"⚠️ EMAIL_MATCHING_FAILED: No stored click found for email {recipient_key}")
+                    log(f"💡 DEBUG: Available emails in storage: {list(RECENT_EMAIL_CLICKS.keys())}")
+                    # Check for case/whitespace variations - use the matching one
+                    for stored_key in RECENT_EMAIL_CLICKS.keys():
+                        if stored_key.lower() == recipient_key.lower() and stored_key != recipient_key:
+                            log(f"💡 DEBUG: Found similar email (case mismatch): '{stored_key}' vs '{recipient_key}', using stored key")
+                            email_click = RECENT_EMAIL_CLICKS.get(stored_key, None)
+                            if email_click:
+                                matching_click = email_click.get("choice")
+                                matching_method = "EMAIL_BASED_NORMALIZED"
+                                log(f"✅ EMAIL_MATCHING_SUCCESS: Matched via normalized email for {recipient_key} → choice: {matching_click}")
+                                break
+                    
+                    # If still no match, this might be a race condition (webhook before click)
+                    if not matching_click:
+                        log(f"⏳ RACE_CONDITION_DETECTED: Webhook arrived before click stored for {recipient_key}, storing as pending")
+                        # Store webhook as pending - will be processed when click arrives
+                        if recipient_key not in PENDING_WEBHOOKS:
+                            PENDING_WEBHOOKS[recipient_key] = []
+                        payload["timestamp"] = datetime.now()
+                        PENDING_WEBHOOKS[recipient_key].append(payload)
+                        log(f"💾 PENDING_WEBHOOK_STORED: Webhook stored as pending for {recipient_key}, will process when click arrives")
+                        # Return early - click handler will process this webhook
+                        return
+
+            # FALLBACK: Time-based matching (only if email-based failed and we have email_id in payload)
+            # This is less deterministic, so we only use it if we have UUID validation
+            if not matching_click:
+                email_uuid_from_payload = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
+                if email_uuid_from_payload:
+                    # If we have UUID, we can use time-based matching more safely
+                    now = datetime.now()
+                    for click_time, choice_val, ip in reversed(list(RECENT_CLICKS)):
+                        time_diff = (now - click_time).total_seconds()
+                        if time_diff < 30:  # Shorter window (30s) for time-based fallback
+                            matching_click = choice_val
+                            matching_method = "TIME_BASED_FALLBACK_WITH_UUID"
+                            log(f"✅ EMAIL_MATCHING_FALLBACK: Matched via time-based fallback → choice: {choice_val} (from {time_diff:.1f}s ago, UUID available)")
+                            break
+                    
+                    if not matching_click:
+                        log(f"❌ EMAIL_MATCHING_FAILED: No click found for email {recipient_key} (no email match, no time-based fallback)")
+            
+            if matching_click:
+                choice = matching_click
+                log(f"📧 EMAIL_MATCHING_COMPLETE: Using choice '{choice}' (matched via {matching_method}) for {recipient_key}")
+                
+                # Get email_account and campaign_id from webhook payload
+                eaccount = payload.get("email_account") or INSTANTLY_EACCOUNT
+                campaign_id_val = campaign_id if campaign_id != "unknown" else None
+                step_val = payload.get("step")
+                if isinstance(step_val, (int, str)):
+                    try:
+                        step_val = int(step_val)
+                    except (ValueError, TypeError):
+                        step_val = None
+                else:
+                    step_val = None
+                
+                # PRIORITY 1: Check if webhook payload contains email_id/uuid directly (THIS IS THE EXACT EMAIL CLICKED)
+                email_uuid = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
+                original_subject = payload.get("subject", "Loan Update")
+                
+                if email_uuid:
+                    log(f"✅ EMAIL_UUID_FOUND_IN_PAYLOAD: Found email_uuid in webhook payload: {email_uuid} (this is the EXACT email clicked)")
+                    log(f"💡 THREADING_FIX: Using UUID from webhook payload ensures reply goes to correct email thread")
+                    # VALIDATE UUID: Verify it actually belongs to this lead_email (deterministic fix)
+                    validated_uuid, validated_subject = await validate_uuid_for_email(email_uuid, eaccount, recipient)
+                    if validated_uuid:
+                        email_uuid = validated_uuid
+                        original_subject = validated_subject if validated_subject else original_subject
+                        log(f"✅ UUID_VALIDATED: UUID confirmed to belong to {recipient_key}")
+                    else:
+                        log(f"⚠️ UUID_VALIDATION_FAILED: UUID {email_uuid} validation failed, but proceeding (may cause threading issues)")
+                        # Continue with original UUID but log warning
+                    
+                    # Cache the UUID from webhook payload to avoid future API calls
+                    cache_key = f"{recipient_key}:{eaccount}:{campaign_id_val or 'none'}:{step_val or 'none'}"
+                    UUID_CACHE[cache_key] = {
+                        "uuid": email_uuid,
+                        "subject": original_subject,
+                        "timestamp": datetime.now()
+                    }
+                    log(f"💾 UUID_CACHED_FROM_PAYLOAD: Stored UUID from webhook payload with step={step_val}")
+                else:
+                    log(f"🔍 EMAIL_UUID_LOOKUP_START: email_uuid not in payload, checking cache then API...")
+                    log(f"🔍 EMAIL_UUID_LOOKUP_START: recipient={recipient_key}, eaccount={eaccount}, campaign_id={campaign_id_val}, step={step_val}")
+                    log(f"💡 DEBUG: Full payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}', step='{step_val}'")
+                    log(f"⚠️ WARNING: Webhook missing email_id - will fetch from API (may not match exact clicked email)")
+                    
+                    # Get email uuid and subject from Instantly.ai API (with caching and step filtering for exact match)
+                    email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val, step_val)
+                
+                log(f"🔍 EMAIL_UUID_LOOKUP_RESULT: uuid={email_uuid}, subject={original_subject}")
+                
+                if email_uuid:
+                    # Get remaining choices
+                    remaining = [c for c in ALL if c != choice]
+                    html = build_html(choice, remaining, recipient)
+                    # Call reply and check if it actually succeeded
+                    reply_success = await reply(eaccount, email_uuid, original_subject, html)
+                    if reply_success:
+                        log(f"✅ REPLY_SENT: Automatic reply sent successfully for choice '{choice}' to {recipient_key} (matched via {matching_method})")
+                    else:
+                        log(f"❌ REPLY_FAILED: Reply API call failed for choice '{choice}' to {recipient_key} (matched via {matching_method}) - check logs above for error details")
+                else:
+                    log(f"❌ REPLY_FAILED: Could not find email uuid for {recipient_key}. Reply not sent.")
+                    log(f"💡 DEBUG: Webhook payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}', recipient='{recipient}'")
+                    log(f"💡 DEBUG: Using eaccount='{eaccount}', campaign_id_val='{campaign_id_val}'")
+            else:
+                log(f"❌ EMAIL_MATCHING_NO_RESULT: No matching click found for webhook from {recipient_key}")
+    except Exception as e:
+        import traceback
+        log(f"❌ WEBHOOK_PROCESSING_EXCEPTION: {str(e)}")
+        log(f"💡 TRACEBACK: {traceback.format_exc()[:500]}")
+
 @app.post("/webhook/instantly")
-async def instantly_webhook(req: Request):
-    log(f"🔔 Webhook endpoint called at {datetime.now().isoformat()}")
-    
+async def instantly_webhook(req: Request, bg: BackgroundTasks):
+    """Fast webhook endpoint - returns immediately, processes in background"""
     try:
         payload = await req.json()
     except Exception as e:
+        # Fast error handling - don't block
         body = await req.body()
         body_str = body.decode('utf-8', errors='ignore')[:200] if body else "(empty)"
-        log(f"❌ invalid_json error={str(e)} body={body_str}")
-        return {"ok":True}
+        log(f"❌ WEBHOOK_INVALID_JSON: {str(e)} body={body_str[:100]}")
+        return {"ok": True, "error": "invalid_json"}
     
     if not payload:
-        log(f"⚠️ empty_payload_received")
-        return {"ok":True}
+        log(f"⚠️ WEBHOOK_EMPTY_PAYLOAD")
+        return {"ok": True, "error": "empty_payload"}
     
-    # Log detailed webhook information (handling Instantly.ai actual payload structure)
+    # Extract minimal info for logging (fast)
     event_type = payload.get("event_type") or payload.get("event") or payload.get("type") or "unknown"
     recipient = payload.get("lead_email") or payload.get("email") or payload.get("recipient") or "unknown"
-    campaign_id = payload.get("campaign_id") or "unknown"
-    campaign_name = payload.get("campaign_name") or "unknown"
-    workspace = payload.get("workspace") or "unknown"
-    step = payload.get("step") or "unknown"
-    email_account = payload.get("email_account") or "unknown"
     
-    log(f"📥 WEBHOOK EVENT: {event_type}")
-    log(f"   👤 Lead Email: {recipient}")
-    log(f"   📧 Email Account: {email_account}")
-    log(f"   📋 Campaign: {campaign_name} ({campaign_id})")
-    log(f"   🔢 Step: {step} | Workspace: {workspace}")
-    log(f"📦 FULL_PAYLOAD: {json.dumps(payload, indent=2)}")
+    # Minimal logging in request handler (fast response)
+    log(f"⚡ WEBHOOK_RECEIVED: {event_type} for {recipient} - queuing for background processing")
     
-    # Check if this is a click event - send automatic reply
-    if "click" in event_type.lower():
-        log(f"✅ LINK_CLICK_WEBHOOK_RECEIVED from Instantly.ai")
-
-        matching_click = None
-        matching_method = None
-        recipient_key = (recipient or "").strip().lower()
-        
-        log(f"🔍 EMAIL_MATCHING_START: Looking for click for email: {recipient_key}")
-        
-        # PRIMARY: Email-based matching
-        if recipient_key:
-            # Debug: Log all stored emails
-            log(f"💡 DEBUG: RECENT_EMAIL_CLICKS keys: {list(RECENT_EMAIL_CLICKS.keys())}")
-            log(f"💡 DEBUG: Looking for key: '{recipient_key}' (type: {type(recipient_key)})")
-            
-            email_click = RECENT_EMAIL_CLICKS.get(recipient_key, None)
-            if email_click:
-                matching_click = email_click.get("choice")
-                email_ts = email_click.get("timestamp")
-                age = (datetime.now() - email_ts).total_seconds() if email_ts else 0
-                matching_method = "EMAIL_BASED"
-                log(f"✅ EMAIL_MATCHING_SUCCESS: Matched via email for {recipient_key} → choice: {matching_click} (age {age:.1f}s)")
-                # Don't pop immediately - keep for duplicate webhook handling (TTL will clean it up)
-            else:
-                log(f"⚠️ EMAIL_MATCHING_FAILED: No stored click found for email {recipient_key}")
-                log(f"💡 DEBUG: Available emails in storage: {list(RECENT_EMAIL_CLICKS.keys())}")
-                # Check for case/whitespace variations - use the matching one
-                for stored_key in RECENT_EMAIL_CLICKS.keys():
-                    if stored_key.lower() == recipient_key.lower() and stored_key != recipient_key:
-                        log(f"💡 DEBUG: Found similar email (case mismatch): '{stored_key}' vs '{recipient_key}', using stored key")
-                        email_click = RECENT_EMAIL_CLICKS.get(stored_key, None)
-                        if email_click:
-                            matching_click = email_click.get("choice")
-                            matching_method = "EMAIL_BASED_NORMALIZED"
-                            log(f"✅ EMAIL_MATCHING_SUCCESS: Matched via normalized email for {recipient_key} → choice: {matching_click}")
-                            break
-                
-                # If still no match, this might be a race condition (webhook before click)
-                if not matching_click:
-                    log(f"⏳ RACE_CONDITION_DETECTED: Webhook arrived before click stored for {recipient_key}, storing as pending")
-                    # Store webhook as pending - will be processed when click arrives
-                    if recipient_key not in PENDING_WEBHOOKS:
-                        PENDING_WEBHOOKS[recipient_key] = []
-                    payload["timestamp"] = datetime.now()
-                    PENDING_WEBHOOKS[recipient_key].append(payload)
-                    log(f"💾 PENDING_WEBHOOK_STORED: Webhook stored as pending for {recipient_key}, will process when click arrives")
-                    # Return early - click handler will process this webhook
-                    return {"ok": True, "pending": True}
-
-        # FALLBACK: Time-based matching (only if email-based failed and we have email_id in payload)
-        # This is less deterministic, so we only use it if we have UUID validation
-        if not matching_click:
-            email_uuid_from_payload = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
-            if email_uuid_from_payload:
-                # If we have UUID, we can use time-based matching more safely
-                now = datetime.now()
-                for click_time, choice_val, ip in reversed(list(RECENT_CLICKS)):
-                    time_diff = (now - click_time).total_seconds()
-                    if time_diff < 30:  # Shorter window (30s) for time-based fallback
-                        matching_click = choice_val
-                        matching_method = "TIME_BASED_FALLBACK_WITH_UUID"
-                        log(f"✅ EMAIL_MATCHING_FALLBACK: Matched via time-based fallback → choice: {choice_val} (from {time_diff:.1f}s ago, UUID available)")
-                        break
-            
-            if not matching_click:
-                log(f"❌ EMAIL_MATCHING_FAILED: No click found for email {recipient_key} (no email match, no time-based fallback)")
-        
-        if matching_click:
-            choice = matching_click
-            log(f"📧 EMAIL_MATCHING_COMPLETE: Using choice '{choice}' (matched via {matching_method}) for {recipient_key}")
-            
-            # Get email_account and campaign_id from webhook payload
-            eaccount = payload.get("email_account") or INSTANTLY_EACCOUNT
-            campaign_id_val = campaign_id if campaign_id != "unknown" else None
-            step_val = payload.get("step")
-            if isinstance(step_val, (int, str)):
-                try:
-                    step_val = int(step_val)
-                except (ValueError, TypeError):
-                    step_val = None
-            else:
-                step_val = None
-            
-            # PRIORITY 1: Check if webhook payload contains email_id/uuid directly (THIS IS THE EXACT EMAIL CLICKED)
-            email_uuid = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
-            original_subject = payload.get("subject", "Loan Update")
-            
-            if email_uuid:
-                log(f"✅ EMAIL_UUID_FOUND_IN_PAYLOAD: Found email_uuid in webhook payload: {email_uuid} (this is the EXACT email clicked)")
-                log(f"💡 THREADING_FIX: Using UUID from webhook payload ensures reply goes to correct email thread")
-                # VALIDATE UUID: Verify it actually belongs to this lead_email (deterministic fix)
-                validated_uuid, validated_subject = await validate_uuid_for_email(email_uuid, eaccount, recipient)
-                if validated_uuid:
-                    email_uuid = validated_uuid
-                    original_subject = validated_subject if validated_subject else original_subject
-                    log(f"✅ UUID_VALIDATED: UUID confirmed to belong to {recipient_key}")
-                else:
-                    log(f"⚠️ UUID_VALIDATION_FAILED: UUID {email_uuid} validation failed, but proceeding (may cause threading issues)")
-                    # Continue with original UUID but log warning
-                
-                # Cache the UUID from webhook payload to avoid future API calls
-                cache_key = f"{recipient_key}:{eaccount}:{campaign_id_val or 'none'}:{step_val or 'none'}"
-                UUID_CACHE[cache_key] = {
-                    "uuid": email_uuid,
-                    "subject": original_subject,
-                    "timestamp": datetime.now()
-                }
-                log(f"💾 UUID_CACHED_FROM_PAYLOAD: Stored UUID from webhook payload with step={step_val}")
-            else:
-                log(f"🔍 EMAIL_UUID_LOOKUP_START: email_uuid not in payload, checking cache then API...")
-                log(f"🔍 EMAIL_UUID_LOOKUP_START: recipient={recipient_key}, eaccount={eaccount}, campaign_id={campaign_id_val}, step={step_val}")
-                log(f"💡 DEBUG: Full payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}', step='{step_val}'")
-                log(f"⚠️ WARNING: Webhook missing email_id - will fetch from API (may not match exact clicked email)")
-                
-                # Get email uuid and subject from Instantly.ai API (with caching and step filtering for exact match)
-                email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val, step_val)
-            
-            log(f"🔍 EMAIL_UUID_LOOKUP_RESULT: uuid={email_uuid}, subject={original_subject}")
-            
-            if email_uuid:
-                # Get remaining choices
-                remaining = [c for c in ALL if c != choice]
-                html = build_html(choice, remaining, recipient)
-                # Call reply and check if it actually succeeded
-                reply_success = await reply(eaccount, email_uuid, original_subject, html)
-                if reply_success:
-                    log(f"✅ REPLY_SENT: Automatic reply sent successfully for choice '{choice}' to {recipient_key} (matched via {matching_method})")
-                else:
-                    log(f"❌ REPLY_FAILED: Reply API call failed for choice '{choice}' to {recipient_key} (matched via {matching_method}) - check logs above for error details")
-            else:
-                log(f"❌ REPLY_FAILED: Could not find email uuid for {recipient_key}. Reply not sent.")
-                log(f"💡 DEBUG: Webhook payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}', recipient='{recipient}'")
-                log(f"💡 DEBUG: Using eaccount='{eaccount}', campaign_id_val='{campaign_id_val}'")
-        else:
-            log(f"❌ EMAIL_MATCHING_NO_RESULT: No matching click found for webhook from {recipient_key}")
+    # Queue heavy processing to background task
+    bg.add_task(process_webhook_logic, payload)
     
-    return {"ok":True}
+    # Return immediately (< 100ms target)
+    return {"ok": True, "queued": True}
 
 
 # ========== HANDLE INSTANTLY.AI TRACKING (if inst.riverline.credit points to us) ==========
