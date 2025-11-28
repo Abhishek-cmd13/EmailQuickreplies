@@ -1300,7 +1300,7 @@ def test_webhook():
         "event_type": "link_clicked",
         "lead_email": "test@example.com",
         "unibox_url": None,
-        "campaign_id": "test-campaign-12345",
+        "campaign_id": None,
         "campaign_name": "Test Campaign",
         "email_account": INSTANTLY_EACCOUNT or "test@example.com"
     }
