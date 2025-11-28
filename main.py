@@ -13,7 +13,7 @@ load_dotenv()
 # ───────── CONFIG ─────────
 INSTANTLY_API_KEY     = os.getenv("INSTANTLY_API_KEY")
 INSTANTLY_EACCOUNT    = os.getenv("INSTANTLY_EACCOUNT")
-FRONTEND_ACTION_BASE  = os.getenv("FRONTEND_ACTION_BASE", "https://riverline.credit/qr")
+FRONTEND_ACTION_BASE  = os.getenv("FRONTEND_ACTION_BASE", "https://riverlinedebtsupport.in")
 ALLOWED_CAMPAIGN_ID   = "e205ce46-f772-42fd-a81c-40eaa996f54e"
 INSTANTLY_URL         = "https://api.instantly.ai/api/v2/emails/reply"
 
@@ -26,6 +26,15 @@ CHOICE_LABELS = {
     "settle_loan": "💠 Settle my loan",
     "never_pay": "⚠️ I will never pay",
     "need_more_time": "⏳ Need more time",
+}
+
+# Map URL paths to choice values
+PATH_TO_CHOICE = {
+    "settle": "settle_loan",
+    "close": "close_loan",
+    "never": "never_pay",
+    "time": "need_more_time",
+    "human": "need_more_time",  # If "human" is also an option
 }
 
 ALL = list(CHOICE_LABELS.keys())
@@ -71,8 +80,19 @@ async def find_email_id_for_lead(lead_email: str, campaign_id: str = None):
 # ───────── BUILD EMAIL HTML ─────────
 def build_html(choice, remaining):
     msg = CHOICE_COPY.get(choice,{"title":"Noted","body":"Response received"})
+    
+    # Map choice to URL path
+    def choice_to_path(c):
+        mapping = {
+            "settle_loan": "settle",
+            "close_loan": "close",
+            "never_pay": "never",
+            "need_more_time": "time"
+        }
+        return mapping.get(c, "unknown")
+    
     next_btn = "".join(
-        f'<a href="{FRONTEND_ACTION_BASE}?c={r}">{CHOICE_LABELS[r]}</a><br>'
+        f'<a href="{FRONTEND_ACTION_BASE}/l/{choice_to_path(r)}">{CHOICE_LABELS[r]}</a><br>'
         for r in remaining
     ) if remaining else "<p>We'll follow up soon.</p>"
     return f"""
@@ -98,7 +118,8 @@ app = FastAPI()
 # Middleware to log ALL incoming requests
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    log(f"🌐 REQUEST: {request.method} {request.url.path} | Client: {request.client.host if request.client else 'unknown'}")
+    host = request.headers.get("host", "unknown")
+    log(f"🌐 REQUEST: {request.method} {request.url.path} | Host: {host} | Client: {request.client.host if request.client else 'unknown'}")
     
     # Log headers for webhook requests
     if request.url.path == "/webhook/instantly":
@@ -174,15 +195,74 @@ async def instantly_webhook(req: Request):
     
     return {"ok":True}
 
-# ========== NO-PAGE CLICK ENDPOINT ==========
+
+# ========== HANDLE INSTANTLY.AI TRACKING (if inst.riverline.credit points to us) ==========
+@app.get("/lt/{tracking_path:path}")
+async def handle_instantly_tracking(tracking_path: str, request: Request):
+    """Handle Instantly.ai tracking redirects - redirect to original destination"""
+    from urllib.parse import parse_qs, urlparse
+    
+    log(f"🔀 Instantly.ai tracking: /lt/{tracking_path}")
+    log(f"   Query params: {dict(request.query_params)}")
+    log(f"   Full URL: {request.url}")
+    
+    # Try to extract destination from query params (Instantly.ai might pass it)
+    query_params = dict(request.query_params)
+    destination = query_params.get("url") or query_params.get("destination") or query_params.get("redirect")
+    
+    if destination:
+        log(f"📍 Found destination in params: {destination}")
+        # Extract choice from destination URL
+        parsed = urlparse(destination)
+        choice_params = parse_qs(parsed.query)
+        choice = choice_params.get("c", choice_params.get("choice", [None]))[0] or "unknown"
+        
+        if choice != "unknown":
+            RECENT_CLICKS.append((datetime.now(), choice, request.client.host if request.client else "unknown"))
+            log(f"💾 Stored choice {choice} from tracking redirect")
+        
+        # Redirect to the original destination
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=destination, status_code=302)
+    
+    # If no destination, try to parse from tracking path or referrer
+    # This is a fallback - Instantly.ai should provide the destination
+    log(f"⚠️ No destination found in tracking URL - Instantly.ai should redirect automatically")
+    log(f"   If this persists, check Instantly.ai link tracking configuration")
+    
+    # Return 204 - let Instantly.ai handle the redirect if possible
+    return PlainTextResponse("", status_code=204)
+
+# ========== PATH-BASED CLICK ENDPOINT ==========
+@app.get("/l/{path_choice}")
+async def link_click(path_choice: str, request: Request):
+    """Handle path-based links like /l/settle, /l/close, /l/human"""
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # Map path to choice
+    choice = PATH_TO_CHOICE.get(path_choice.lower(), "unknown")
+    
+    log(f"🔗 LINK_CLICKED: /l/{path_choice} → choice: {choice} | IP: {client_ip}")
+    
+    # Store the click with timestamp - webhook will match within 60 seconds
+    if choice != "unknown":
+        RECENT_CLICKS.append((datetime.now(), choice, client_ip))
+        log(f"💾 Stored choice {choice} - waiting for webhook (will match within 60s)")
+    else:
+        log(f"⚠️ Unknown path choice: {path_choice}")
+    
+    log(f"ℹ️ Instantly.ai will send webhook → automatic reply will be sent")
+    return PlainTextResponse("",status_code=204)  # invisible
+
+# ========== LEGACY QUERY PARAM ENDPOINT (for backwards compatibility) ==========
 @app.get("/qr")
 async def qr_click(request: Request): 
-    # Log when someone clicks a link
+    # Log when someone clicks a link (legacy format)
     query_params = dict(request.query_params)
     choice = query_params.get("c") or query_params.get("choice") or "unknown"
     client_ip = request.client.host if request.client else "unknown"
     
-    log(f"🔗 LINK_CLICKED: /qr?c={choice} | Params: {query_params} | IP: {client_ip}")
+    log(f"🔗 LINK_CLICKED (legacy): /qr?c={choice} | Params: {query_params} | IP: {client_ip}")
     
     # Store the click with timestamp - webhook will match within 60 seconds
     if choice != "unknown":
@@ -209,7 +289,8 @@ def status():
         "webhook_url": f"https://emailquickreplies.onrender.com/webhook/instantly",
         "campaign_id": ALLOWED_CAMPAIGN_ID,
         "frontend_action_base": FRONTEND_ACTION_BASE,
-        "domain": "riverline.credit",
+        "domain": "inst.riverline.credit",
+        "click_endpoint": "/qr",
         "logs_count": len(LOGS),
         "recent_events": list(LOGS)[-10:] if LOGS else []
     }
