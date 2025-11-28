@@ -479,12 +479,21 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str, reci
     
     try:
         async with httpx.AsyncClient(timeout=30) as c:  # Increased timeout to 30s
+            # Build reply payload - Instantly.ai might need recipient email
             reply_json = {
                 "eaccount": eaccount,
                 "reply_to_uuid": reply_to_uuid,
                 "subject": reply_subject,
                 "body": {"html": html}
             }
+            
+            # Add recipient email if provided (some APIs require it for verification)
+            if recipient_email:
+                reply_json["to"] = recipient_email
+                reply_json["lead_email"] = recipient_email
+                log(f"📋 REPLY_RECIPIENT_ADDED: Added recipient email to payload: {recipient_email}")
+            else:
+                log(f"⚠️ REPLY_WARNING: No recipient email provided - relying on reply_to_uuid for routing")
             
             log(f"📤 REPLY_API_REQUEST: POST {INSTANTLY_URL}")
             log(f"📤 REPLY_API_HEADERS: Authorization=Bearer {INSTANTLY_API_KEY[:10]}...")
