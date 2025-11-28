@@ -519,39 +519,85 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str, reci
                 log(f"📡 REPLY_API_RESPONSE (retry): Status {r.status_code}, Duration {request_duration:.2f}s")
                 log(f"📡 REPLY_API_RESPONSE_BODY (retry): {response_body[:2000]}")
             
+            # Log full response body FIRST (for debugging)
+            log(f"📋 REPLY_RESPONSE_FULL_BODY: {response_body}")
+            
             # Parse response
             response_json = None
             try:
                 response_json = r.json() if response_body else None
-                log(f"📋 REPLY_RESPONSE_JSON: {json.dumps(response_json, indent=2) if response_json else 'None'}")
+                if response_json:
+                    log(f"📋 REPLY_RESPONSE_JSON: {json.dumps(response_json, indent=2)}")
+                else:
+                    log(f"⚠️ REPLY_RESPONSE_NO_JSON: Response body exists but not JSON - {response_body[:500]}")
             except Exception as json_error:
                 log(f"⚠️ REPLY_RESPONSE_NOT_JSON: Could not parse as JSON - {str(json_error)}")
-                log(f"📋 REPLY_RESPONSE_RAW: {response_body[:2000]}")
+                log(f"📋 REPLY_RESPONSE_RAW: {response_body}")
+                # If response is not JSON, log it fully and treat as potential error
+                log(f"⚠️ REPLY_WARNING: Non-JSON response from Instantly.ai API - this may indicate an error")
             
             # Check for errors in response JSON
             if response_json:
-                # Check for common error fields
-                error_message = response_json.get("error") or response_json.get("message") or response_json.get("errors")
+                # Check for common error fields (more comprehensive)
+                error_message = (response_json.get("error") or 
+                               response_json.get("message") or 
+                               response_json.get("errors") or
+                               response_json.get("error_message") or
+                               response_json.get("error_detail"))
+                
                 if error_message:
                     log(f"❌ REPLY_ERROR_IN_RESPONSE: {error_message}")
-                    log(f"❌ REPLY_FAILED: API returned success status but contains error message")
+                    log(f"❌ REPLY_FAILED: API returned HTTP success but contains error message")
+                    log(f"📋 REPLY_ERROR_FULL: {json.dumps(response_json, indent=2)}")
                     return False
                 
-                # Check for success indicators
+                # Check for success indicators (more comprehensive)
                 success = response_json.get("success")
                 status = response_json.get("status")
-                if success is False or (status and status.lower() in ["error", "failed"]):
-                    log(f"❌ REPLY_FAILED: API response indicates failure - success={success}, status={status}")
+                state = response_json.get("state")
+                
+                # Log all status fields
+                log(f"📋 REPLY_STATUS_FIELDS: success={success}, status={status}, state={state}")
+                
+                # Check for explicit failures
+                if success is False:
+                    log(f"❌ REPLY_FAILED: API response has success=False")
+                    return False
+                
+                if status and status.lower() in ["error", "failed", "rejected", "bounced"]:
+                    log(f"❌ REPLY_FAILED: API response status indicates failure - status='{status}'")
+                    return False
+                
+                if state and state.lower() in ["error", "failed", "rejected"]:
+                    log(f"❌ REPLY_FAILED: API response state indicates failure - state='{state}'")
                     return False
                 
                 # Log success indicators
-                if success is True or (status and status.lower() in ["success", "sent", "queued"]):
-                    log(f"✅ REPLY_SUCCESS_INDICATOR: success={success}, status={status}")
+                if success is True:
+                    log(f"✅ REPLY_SUCCESS_FIELD: success=True in response")
+                
+                if status and status.lower() in ["success", "sent", "queued", "accepted", "delivered"]:
+                    log(f"✅ REPLY_STATUS_POSITIVE: status='{status}' indicates success")
+                
+                if state and state.lower() in ["sent", "queued", "accepted", "delivered"]:
+                    log(f"✅ REPLY_STATE_POSITIVE: state='{state}' indicates success")
                 
                 # Log any email ID or tracking info
-                email_id = response_json.get("id") or response_json.get("email_id") or response_json.get("uuid")
+                email_id = (response_json.get("id") or 
+                           response_json.get("email_id") or 
+                           response_json.get("uuid") or
+                           response_json.get("email_uuid") or
+                           response_json.get("message_id"))
                 if email_id:
-                    log(f"✅ REPLY_EMAIL_ID: {email_id}")
+                    log(f"✅ REPLY_EMAIL_ID: Got email ID from response - {email_id}")
+                else:
+                    log(f"⚠️ REPLY_WARNING: No email ID in response - this might indicate email wasn't queued")
+                    log(f"📋 REPLY_ALL_KEYS: {list(response_json.keys())}")
+                
+                # Check if response indicates email was actually queued/sent
+                # Some APIs return 200 but email is still processing
+                if not email_id and not success and not status:
+                    log(f"⚠️ REPLY_WARNING: Response lacks clear success indicators - may not have been sent")
             
             if r.status_code > 299:
                 log(f"❌ REPLY_API_ERROR: HTTP Status {r.status_code}")
@@ -560,19 +606,46 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str, reci
                 return False
             elif r.status_code == 200 or r.status_code == 201:
                 log(f"✅ REPLY_API_HTTP_SUCCESS: Status {r.status_code}")
+                
+                # Final verification - be very strict
                 if response_json:
-                    log(f"✅ REPLY_RESPONSE_DETAILS: {json.dumps(response_json, indent=2)}")
+                    # Check again for errors (double check)
+                    has_error = (response_json.get("error") or 
+                                response_json.get("errors") or
+                                response_json.get("success") is False or
+                                (response_json.get("status") and response_json.get("status").lower() in ["error", "failed"]))
+                    
+                    if has_error:
+                        log(f"❌ REPLY_VERIFICATION_FAILED: Response JSON indicates failure despite HTTP {r.status_code}")
+                        log(f"📋 REPLY_FAILURE_DETAILS: {json.dumps(response_json, indent=2)}")
+                        return False
+                    
+                    # Check if we got an email ID (indicates email was queued)
+                    email_id = (response_json.get("id") or 
+                               response_json.get("email_id") or 
+                               response_json.get("uuid"))
+                    
+                    if not email_id:
+                        log(f"⚠️ REPLY_WARNING: HTTP {r.status_code} but no email ID in response")
+                        log(f"⚠️ REPLY_WARNING: This might mean email was accepted but not queued")
+                        log(f"📋 REPLY_RESPONSE_KEYS: {list(response_json.keys())}")
+                        # Still return True but log warning - some APIs don't return ID immediately
+                    
+                    log(f"✅ REPLY_VERIFIED_SUCCESS: Email reply accepted by Instantly.ai API")
+                    log(f"📧 REPLY_DETAILS: Recipient={recipient_email}, Subject='{reply_subject}', UUID={reply_to_uuid}, ResponseEmailID={email_id}")
+                    log(f"📋 REPLY_FULL_RESPONSE: {json.dumps(response_json, indent=2)}")
+                    return True
                 else:
-                    log(f"⚠️ REPLY_WARNING: Success status but no JSON response - response: {response_body[:500]}")
-                
-                # Final verification
-                if response_json and (response_json.get("success") is False or response_json.get("error")):
-                    log(f"❌ REPLY_VERIFICATION_FAILED: Response indicates failure despite HTTP success")
-                    return False
-                
-                log(f"✅ REPLY_VERIFIED_SUCCESS: Email reply sent successfully via Instantly.ai API")
-                log(f"📧 REPLY_DETAILS: Recipient={recipient_email}, Subject='{reply_subject}', UUID={reply_to_uuid}")
-                return True
+                    log(f"⚠️ REPLY_WARNING: HTTP {r.status_code} but no JSON response")
+                    log(f"⚠️ REPLY_WARNING: Response body: {response_body}")
+                    # Non-JSON response might be an error - be cautious
+                    if "error" in response_body.lower() or "failed" in response_body.lower():
+                        log(f"❌ REPLY_FAILED: Response body contains error keywords")
+                        return False
+                    # Some APIs return plain text success - log it
+                    log(f"✅ REPLY_VERIFIED_SUCCESS: HTTP {r.status_code} with non-JSON response (may be OK)")
+                    log(f"📧 REPLY_DETAILS: Recipient={recipient_email}, Subject='{reply_subject}', UUID={reply_to_uuid}")
+                    return True
             else:
                 # Unusual status code
                 log(f"⚠️ REPLY_UNUSUAL_STATUS: HTTP Status {r.status_code} (expected 200/201)")
