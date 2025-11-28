@@ -122,9 +122,12 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                     latest = emails[0]
                     # API returns "id" field as the uuid
                     uuid = latest.get("id")
-                    subject = latest.get("subject", "Loan Update")
+                    subject = latest.get("subject") or latest.get("email_subject") or "Loan Update"
+                    if not subject or not subject.strip():
+                        subject = "Loan Update"
                     log(f"✅ UUID_FOUND: uuid={uuid}, subject={subject}")
                     log(f"💡 DEBUG: Latest email keys: {list(latest.keys())}")
+                    log(f"💡 DEBUG: Subject from API: '{latest.get('subject')}' or '{latest.get('email_subject')}'")
                     return uuid, subject
                 else:
                     log(f"⚠️ UUID_NOT_FOUND: No emails found for {lead_email}")
@@ -194,6 +197,9 @@ def build_html(choice, remaining, recipient_email: Optional[str] = None):
 # ───────── SEND REPLY IN SAME THREAD ─────────
 async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
     """Send reply email via Instantly.ai API"""
+    # Handle empty subject - use default if missing
+    if not subject or not subject.strip():
+        subject = "Loan Update"
     # Ensure subject has "Re: " prefix if not present
     reply_subject = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
     
@@ -204,13 +210,25 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
             "subject": reply_subject,
             "body": {"html": html}
         }
-        log(f"📤 Sending reply: uuid={reply_to_uuid}, subject={reply_subject}, eaccount={eaccount}")
+        log(f"📤 REPLY_PAYLOAD: uuid={reply_to_uuid}, subject={reply_subject}, eaccount={eaccount}")
+        log(f"📤 REPLY_PAYLOAD_FULL: {json.dumps(reply_json, indent=2)[:500]}")
         r = await c.post(INSTANTLY_URL, json=reply_json, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
         
+        log(f"📡 REPLY_API_RESPONSE: Status {r.status_code}")
+        
         if r.status_code > 299:
-            log(f"❌ REPLY_API_ERROR: Status {r.status_code}, Response: {r.text[:200]}")
+            error_response = r.text[:500] if r.text else "No error message"
+            log(f"❌ REPLY_API_ERROR: Status {r.status_code}, Response: {error_response}")
+            log(f"💡 REPLY_DEBUG: Request payload was: {json.dumps(reply_json, indent=2)[:500]}")
         else:
-            log(f"✅ REPLY_API_SUCCESS: Reply sent successfully (status {r.status_code})")
+            response_text = r.text[:500] if r.text else "No response body"
+            log(f"✅ REPLY_API_SUCCESS: Status {r.status_code}, Response: {response_text}")
+            # Log full response for debugging
+            try:
+                response_json = r.json()
+                log(f"💡 REPLY_RESPONSE_DETAILS: {json.dumps(response_json, indent=2)[:500]}")
+            except:
+                log(f"💡 REPLY_RESPONSE_TEXT: {response_text}")
 
 # ========== WEBHOOK ==========
 app = FastAPI()
