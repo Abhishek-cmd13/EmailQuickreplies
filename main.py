@@ -14,6 +14,7 @@ load_dotenv()
 INSTANTLY_API_KEY     = os.getenv("INSTANTLY_API_KEY")
 INSTANTLY_EACCOUNT    = os.getenv("INSTANTLY_EACCOUNT")
 FRONTEND_ACTION_BASE  = os.getenv("FRONTEND_ACTION_BASE", "https://l.riverlinedebtsupport.in")
+BACKEND_BASE_URL      = os.getenv("BACKEND_BASE_URL", "https://riverline.credit")
 ALLOWED_CAMPAIGN_ID   = "e205ce46-f772-42fd-a81c-40eaa996f54e"
 INSTANTLY_URL         = "https://api.instantly.ai/api/v2/emails/reply"
 
@@ -268,8 +269,19 @@ def status():
         "webhook_url": f"https://emailquickreplies.onrender.com/webhook/instantly",
         "campaign_id": ALLOWED_CAMPAIGN_ID,
         "frontend_action_base": FRONTEND_ACTION_BASE,
-        "domain": "inst.riverline.credit",
-        "click_endpoint": "/qr",
+        "backend_base_url": BACKEND_BASE_URL,
+        "click_endpoints": {
+            "settle": f"{BACKEND_BASE_URL}/settle",
+            "close": f"{BACKEND_BASE_URL}/close",
+            "never": f"{BACKEND_BASE_URL}/never",
+            "human": f"{BACKEND_BASE_URL}/human"
+        },
+        "email_links": {
+            "settle": f"{FRONTEND_ACTION_BASE}/settle",
+            "close": f"{FRONTEND_ACTION_BASE}/close",
+            "never": f"{FRONTEND_ACTION_BASE}/never",
+            "human": f"{FRONTEND_ACTION_BASE}/human"
+        },
         "logs_count": len(LOGS),
         "recent_events": list(LOGS)[-10:] if LOGS else []
     }
