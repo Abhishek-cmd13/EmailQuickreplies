@@ -326,6 +326,10 @@ async def instantly_webhook(req: Request):
         
         # PRIMARY: Email-based matching
         if recipient_key:
+            # Debug: Log all stored emails
+            log(f"💡 DEBUG: RECENT_EMAIL_CLICKS keys: {list(RECENT_EMAIL_CLICKS.keys())}")
+            log(f"💡 DEBUG: Looking for key: '{recipient_key}' (type: {type(recipient_key)})")
+            
             email_click = RECENT_EMAIL_CLICKS.get(recipient_key, None)
             if email_click:
                 matching_click = email_click.get("choice")
@@ -336,6 +340,11 @@ async def instantly_webhook(req: Request):
                 # Don't pop immediately - keep for duplicate webhook handling (TTL will clean it up)
             else:
                 log(f"⚠️ EMAIL_MATCHING_FAILED: No stored click found for email {recipient_key}")
+                log(f"💡 DEBUG: Available emails in storage: {list(RECENT_EMAIL_CLICKS.keys())}")
+                # Check for case/whitespace variations
+                for stored_key in RECENT_EMAIL_CLICKS.keys():
+                    if stored_key.lower() == recipient_key.lower():
+                        log(f"💡 DEBUG: Found similar email (case mismatch?): '{stored_key}' vs '{recipient_key}'")
 
         # FALLBACK: Time-based matching
         if not matching_click:
