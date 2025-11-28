@@ -2,6 +2,7 @@ import os, logging, json
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from collections import deque
+from urllib.parse import quote_plus
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -50,11 +51,30 @@ CHOICE_COPY = {
 # ───────── LOG BUFFER (UI readable) ─────────
 LOGS = deque(maxlen=800)
 
+# Store recent clicks keyed by email so we can match instantly via webhook
+RECENT_EMAIL_CLICKS: Dict[str, Dict[str, Any]] = {}
+# Fallback click history (time-based) to support old links without email param
+RECENT_CLICKS = deque(maxlen=100)
+EMAIL_CLICK_TTL_SECONDS = 3600  # one hour safety window
+
 def log(x): LOGS.append({"t":datetime.now().isoformat(),"m":x}); print(x)
 
-# ───────── TEMP STORAGE FOR CLICKS (to match with webhooks) ─────────
-# Stores recent clicks: [(timestamp, choice, ip), ...]
-RECENT_CLICKS = deque(maxlen=100)
+def store_email_click(email: str, choice: str, client_ip: str) -> None:
+    """Store email→choice mapping for fast webhook matching."""
+    if not email or not choice or choice == "unknown":
+        return
+    normalized = email.strip().lower()
+    if not normalized:
+        return
+    now = datetime.now()
+    RECENT_EMAIL_CLICKS[normalized] = {"choice": choice, "timestamp": now}
+    log(f"📧 Stored choice {choice} for email {normalized} (IP: {client_ip})")
+    # Prune stale entries
+    cutoff_delta = EMAIL_CLICK_TTL_SECONDS
+    for key, data in list(RECENT_EMAIL_CLICKS.items()):
+        ts = data.get("timestamp")
+        if ts and (now - ts).total_seconds() > cutoff_delta:
+            del RECENT_EMAIL_CLICKS[key]
 
 async def find_email_id_for_lead(lead_email: str, campaign_id: str = None):
     """Try to find email_id for a lead using Instantly.ai API"""
@@ -79,7 +99,7 @@ async def find_email_id_for_lead(lead_email: str, campaign_id: str = None):
     return None
 
 # ───────── BUILD EMAIL HTML ─────────
-def build_html(choice, remaining):
+def build_html(choice, remaining, recipient_email: Optional[str] = None):
     msg = CHOICE_COPY.get(choice,{"title":"Noted","body":"Response received"})
     
     # Map choice to URL path
@@ -92,8 +112,12 @@ def build_html(choice, remaining):
         }
         return mapping.get(c, "unknown")
     
+    email_suffix = ""
+    if recipient_email:
+        email_suffix = f"?email={quote_plus(recipient_email)}"
+
     next_btn = "".join(
-        f'<a href="{FRONTEND_ACTION_BASE}/{choice_to_path(r)}">{CHOICE_LABELS[r]}</a><br>'
+        f'<a href="{FRONTEND_ACTION_BASE}/{choice_to_path(r)}{email_suffix}">{CHOICE_LABELS[r]}</a><br>'
         for r in remaining
     ) if remaining else "<p>We'll follow up soon.</p>"
     return f"""
@@ -166,16 +190,26 @@ async def instantly_webhook(req: Request):
     # Check if this is a click event - send automatic reply
     if "click" in event_type.lower():
         log(f"✅ LINK_CLICK_WEBHOOK_RECEIVED from Instantly.ai")
-        
-        # Find most recent click within last 60 seconds
-        now = datetime.now()
+
         matching_click = None
-        for click_time, choice, ip in reversed(list(RECENT_CLICKS)):
-            time_diff = (now - click_time).total_seconds()
-            if time_diff < 60:  # Within last 60 seconds
-                matching_click = choice
-                log(f"📌 Matched with recent click: {choice} (from {time_diff:.1f}s ago)")
-                break
+        recipient_key = (recipient or "").strip().lower()
+        if recipient_key:
+            email_click = RECENT_EMAIL_CLICKS.pop(recipient_key, None)
+            if email_click:
+                matching_click = email_click.get("choice")
+                email_ts = email_click.get("timestamp")
+                age = (datetime.now() - email_ts).total_seconds() if email_ts else 0
+                log(f"📌 Matched via email: {recipient_key} (age {age:.1f}s)")
+
+        # Fallback: Find most recent click within last 60 seconds
+        if not matching_click:
+            now = datetime.now()
+            for click_time, choice_val, ip in reversed(list(RECENT_CLICKS)):
+                time_diff = (now - click_time).total_seconds()
+                if time_diff < 60:  # Within last 60 seconds
+                    matching_click = choice_val
+                    log(f"📌 Matched with recent click (fallback): {choice_val} (from {time_diff:.1f}s ago)")
+                    break
         
         if matching_click:
             choice = matching_click
@@ -186,13 +220,13 @@ async def instantly_webhook(req: Request):
             if email_id:
                 # Get remaining choices
                 remaining = [c for c in ALL if c != choice]
-                html = build_html(choice, remaining)
+                html = build_html(choice, remaining, recipient)
                 await reply(email_id, "Loan Update", html)
                 log(f"✅ Reply sent for choice: {choice} to {recipient}")
             else:
                 log(f"⚠️ Could not find email_id for {recipient}. Reply not sent.")
         else:
-            log(f"⚠️ No recent click found (within 60s). Reply not sent.")
+            log(f"⚠️ No recent click found (via email or fallback). Reply not sent.")
     
     return {"ok":True}
 
@@ -297,10 +331,10 @@ def test_page():
         <p>Click any link below. If Instantly.ai tracking works, you should see a webhook in /logs</p>
         <hr>
         <h2>Test Links:</h2>
-        <a href="{FRONTEND_ACTION_BASE}?c=close_loan" target="_blank">🔵 Close my loan</a><br><br>
-        <a href="{FRONTEND_ACTION_BASE}?c=settle_loan" target="_blank">💠 Settle my loan</a><br><br>
-        <a href="{FRONTEND_ACTION_BASE}?c=never_pay" target="_blank">⚠️ I will never pay</a><br><br>
-        <a href="{FRONTEND_ACTION_BASE}?c=need_more_time" target="_blank">⏳ Need more time</a><br><br>
+        <a href="{FRONTEND_ACTION_BASE}/close?email=test@example.com" target="_blank">🔵 Close my loan</a><br><br>
+        <a href="{FRONTEND_ACTION_BASE}/settle?email=test@example.com" target="_blank">💠 Settle my loan</a><br><br>
+        <a href="{FRONTEND_ACTION_BASE}/never?email=test@example.com" target="_blank">⚠️ I will never pay</a><br><br>
+        <a href="{FRONTEND_ACTION_BASE}/human?email=test@example.com" target="_blank">⏳ Need more time</a><br><br>
         <hr>
         <h2>Check Results:</h2>
         <a href="/logs" target="_blank">View Logs</a> | 
@@ -356,14 +390,23 @@ def test_webhook():
 async def link_click(path_choice: str, request: Request):
     """Handle path-based links like /settle, /close, /human - catch-all route at end"""
     client_ip = request.client.host if request.client else "unknown"
-    
+
     # Map path to choice
     choice = PATH_TO_CHOICE.get(path_choice.lower(), "unknown")
     
     log(f"🔗 LINK_CLICKED: /{path_choice} → choice: {choice} | IP: {client_ip}")
+
+    query_params = dict(request.query_params)
+    email_param = (
+        query_params.get("email")
+        or query_params.get("lead_email")
+        or query_params.get("recipient")
+    )
     
     # Store the click with timestamp - webhook will match within 60 seconds
     if choice != "unknown":
+        if email_param:
+            store_email_click(email_param, choice, client_ip)
         RECENT_CLICKS.append((datetime.now(), choice, client_ip))
         log(f"💾 Stored choice {choice} - waiting for webhook (will match within 60s)")
     else:
