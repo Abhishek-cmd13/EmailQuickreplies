@@ -212,10 +212,17 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
     # Use the original subject from the email we're replying to (for thread continuity)
     # Don't modify it - Instantly.ai will handle threading via reply_to_uuid
     # If subject is empty, we shouldn't use a default - we need the actual original subject
+    # Use the original subject from the email we're replying to (for thread continuity)
+    # For proper email threading, add "Re:" prefix if not already present
     if not subject or not subject.strip():
         log(f"⚠️ REPLY_WARNING: Empty subject provided - this may cause threading issues")
-        # Try to get subject from API by UUID if we have it
         subject = "Loan Update"  # Fallback only if absolutely necessary
+    
+    # Add "Re:" prefix for proper threading (but don't add if already present)
+    if not subject.lower().startswith("re:"):
+        reply_subject = f"Re: {subject}"
+    else:
+        reply_subject = subject  # Already has "Re:" prefix
     
     async with httpx.AsyncClient(timeout=15) as c:
         reply_json = {
@@ -225,6 +232,7 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
             "body": {"html": html}
         }
         log(f"📤 REPLY_PAYLOAD: uuid={reply_to_uuid}, subject={reply_subject}, eaccount={eaccount}")
+        log(f"💡 REPLY_THREADING: Original subject='{subject}' → Reply subject='{reply_subject}' (for thread continuity)")
         log(f"📤 REPLY_PAYLOAD_FULL: {json.dumps(reply_json, indent=2)[:500]}")
         r = await c.post(INSTANTLY_URL, json=reply_json, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
         
