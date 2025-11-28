@@ -1244,7 +1244,7 @@ def clear_logs():
 def status():
     """Check webhook configuration status"""
     return {
-        "webhook_url": f"https://emailquickreplies.onrender.com/webhook/instantly",
+        "webhook_url": f"{BACKEND_BASE_URL}/webhook/instantly",
         "campaign_id": ALLOWED_CAMPAIGN_ID,
         "frontend_action_base": FRONTEND_ACTION_BASE,
         "backend_base_url": BACKEND_BASE_URL,
