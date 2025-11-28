@@ -1003,7 +1003,6 @@ def logs_get_requests():
             "EMAIL_MATCHING_START",  # Matching process
             "EMAIL_MATCHING_SUCCESS",
             "EMAIL_MATCHING_FAILED",
-            "EMAIL_MATCHING_FALLBACK",
             "EMAIL_MATCHING_NO_RESULT",
             "EMAIL_MATCHING_COMPLETE",
             "DEBUG"
