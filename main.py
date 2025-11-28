@@ -467,7 +467,9 @@ def logs_get_requests():
             "Matched",
             "REPLY_SENT",
             "REPLY_FAILED",
-            "WEBHOOK",
+            "WEBHOOK",  # Matches WEBHOOK_HEADERS, WEBHOOK EVENT, WEBHOOK_RESPONSE, etc.
+            "webhook",  # Case-insensitive match
+            "link_clicked",  # Event type from Instantly.ai
             "EMAIL_ID",
             "EMAIL_UUID",
             "UUID",
@@ -477,6 +479,14 @@ def logs_get_requests():
             "API_ERROR",
             "EMAIL_CLICK_STORED",
             "EMAIL_CLICK_WAITING",
+            "FULL_PAYLOAD",  # Webhook payload logging
+            "LINK_CLICK_WEBHOOK",  # Webhook received message
+            "EMAIL_MATCHING_START",  # Matching process
+            "EMAIL_MATCHING_SUCCESS",
+            "EMAIL_MATCHING_FAILED",
+            "EMAIL_MATCHING_FALLBACK",
+            "EMAIL_MATCHING_NO_RESULT",
+            "EMAIL_MATCHING_COMPLETE",
             "DEBUG"
         ])
     ]
