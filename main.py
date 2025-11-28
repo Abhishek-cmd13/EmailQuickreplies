@@ -394,7 +394,6 @@ def logs_live_html():
     <head>
         <title>Live GET Request Logs - Production Tracking</title>
         <meta charset="UTF-8">
-        <meta http-equiv="refresh" content="2">
         <style>
             body {
                 font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
@@ -483,33 +482,8 @@ def logs_live_html():
         </div>
         
         <script>
-            async function loadLogs() {
-                try {
-                    const response = await fetch('/logs/get-requests');
-                    const logs = await response.json();
-                    const container = document.getElementById('logs');
-                    
-                    if (logs.length === 0) {
-                        container.innerHTML = '<p style="color: #858585;">No GET requests yet. Waiting for clicks...</p>';
-                        return;
-                    }
-                    
-                    let html = '';
-                    logs.slice().reverse().forEach(log => {
-                        const isClick = log.m && (log.m.includes('LINK_CLICKED') || log.m.includes('Stored choice'));
-                        const logClass = isClick ? 'log-entry click-highlight' : 'log-entry';
-                        html += `
-                            <div class="${logClass}">
-                                <div class="log-time">${log.t || ''}</div>
-                                <div class="log-message">${escapeHtml(log.m || '')}</div>
-                            </div>
-                        `;
-                    });
-                    container.innerHTML = html;
-                } catch (error) {
-                    document.getElementById('logs').innerHTML = `<p style="color: #f48771;">Error loading logs: ${error.message}</p>`;
-                }
-            }
+            let lastLogCount = 0;
+            let loadedLogs = new Set(); // Track loaded log entries to avoid duplicates
             
             function escapeHtml(text) {
                 const div = document.createElement('div');
@@ -517,11 +491,98 @@ def logs_live_html():
                 return div.innerHTML;
             }
             
-            // Load immediately
-            loadLogs();
+            function createLogEntry(log) {
+                const isClick = log.m && (log.m.includes('LINK_CLICKED') || log.m.includes('Stored choice') || log.m.includes('EMAIL_MATCHING') || log.m.includes('REPLY_SENT'));
+                const logClass = isClick ? 'log-entry click-highlight' : 'log-entry';
+                const logId = `${log.t || Date.now()}_${log.m ? log.m.substring(0, 50) : ''}`;
+                
+                return {
+                    id: logId,
+                    html: `
+                        <div class="${logClass}" data-log-id="${logId}">
+                            <div class="log-time">${log.t || ''}</div>
+                            <div class="log-message">${escapeHtml(log.m || '')}</div>
+                        </div>
+                    `
+                };
+            }
             
-            // Auto-refresh every 2 seconds
-            setInterval(loadLogs, 2000);
+            async function appendNewLogs() {
+                try {
+                    const response = await fetch('/logs/get-requests');
+                    const logs = await response.json();
+                    const container = document.getElementById('logs');
+                    
+                    if (logs.length === 0 && lastLogCount === 0) {
+                        container.innerHTML = '<p style="color: #858585;">No logs yet. Waiting for activity...</p>';
+                        return;
+                    }
+                    
+                    // Only process new logs
+                    if (logs.length > lastLogCount) {
+                        const newLogs = logs.slice(lastLogCount);
+                        
+                        newLogs.reverse().forEach(log => {
+                            const entry = createLogEntry(log);
+                            if (!loadedLogs.has(entry.id)) {
+                                loadedLogs.add(entry.id);
+                                container.insertAdjacentHTML('afterbegin', entry.html);
+                            }
+                        });
+                        
+                        lastLogCount = logs.length;
+                        
+                        // Keep only last 100 entries visible
+                        const allEntries = container.querySelectorAll('.log-entry');
+                        if (allEntries.length > 100) {
+                            for (let i = 100; i < allEntries.length; i++) {
+                                const logId = allEntries[i].getAttribute('data-log-id');
+                                loadedLogs.delete(logId);
+                                allEntries[i].remove();
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error loading logs:', error);
+                }
+            }
+            
+            // Initial load
+            async function initialLoad() {
+                try {
+                    const response = await fetch('/logs/get-requests');
+                    const logs = await response.json();
+                    const container = document.getElementById('logs');
+                    
+                    if (logs.length === 0) {
+                        container.innerHTML = '<p style="color: #858585;">No logs yet. Waiting for activity...</p>';
+                        return;
+                    }
+                    
+                    // Load last 50 entries initially
+                    const initialLogs = logs.slice(-50).reverse();
+                    let html = '';
+                    
+                    initialLogs.forEach(log => {
+                        const entry = createLogEntry(log);
+                        if (!loadedLogs.has(entry.id)) {
+                            loadedLogs.add(entry.id);
+                            html += entry.html;
+                        }
+                    });
+                    
+                    container.innerHTML = html;
+                    lastLogCount = logs.length;
+                } catch (error) {
+                    document.getElementById('logs').innerHTML = `<p style="color: #f48771;">Error loading logs: ${error.message}</p>`;
+                }
+            }
+            
+            // Initial load
+            initialLoad();
+            
+            // Append new logs every 2 seconds (no full refresh)
+            setInterval(appendNewLogs, 2000);
         </script>
     </body>
     </html>
