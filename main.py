@@ -95,9 +95,12 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
     """Try to find email uuid and subject for a lead using Instantly.ai API"""
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            # Try to get campaign emails
-            url = "https://api.instantly.ai/api/v2/emails/list"
-            params = {"eaccount": eaccount, "email": lead_email}
+            # Correct endpoint: /api/v2/emails (not /list)
+            url = "https://api.instantly.ai/api/v2/emails"
+            params = {
+                "eaccount": eaccount,
+                "lead": lead_email  # Use "lead" parameter, not "email"
+            }
             if campaign_id:
                 params["campaign_id"] = campaign_id
             
@@ -109,21 +112,24 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
             
             if r.status_code == 200:
                 data = r.json()
-                emails = data.get("emails", [])
+                # API returns items array in response
+                emails = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
                 log(f"📧 API_RESULT: Found {len(emails)} email(s) for {lead_email}")
                 
                 if emails:
-                    # Sort by sent_at (most recent first)
-                    emails.sort(key=lambda x: x.get("sent_at", ""), reverse=True)
+                    # Sort by timestamp_created (most recent first)
+                    emails.sort(key=lambda x: x.get("timestamp_created", x.get("timestamp_email", "")), reverse=True)
                     latest = emails[0]
-                    uuid = latest.get("uuid")
+                    # API returns "id" field as the uuid
+                    uuid = latest.get("id")
                     subject = latest.get("subject", "Loan Update")
                     log(f"✅ UUID_FOUND: uuid={uuid}, subject={subject}")
                     log(f"💡 DEBUG: Latest email keys: {list(latest.keys())}")
                     return uuid, subject
                 else:
                     log(f"⚠️ UUID_NOT_FOUND: No emails found for {lead_email}")
-                    log(f"💡 DEBUG: API returned data keys: {list(data.keys())}")
+                    log(f"💡 DEBUG: API returned data type: {type(data)}")
+                    log(f"💡 DEBUG: Response keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
                     log(f"💡 DEBUG: Response data: {json.dumps(data, indent=2)[:500]}")
             else:
                 error_text = r.text[:500] if r.text else "No error message"
