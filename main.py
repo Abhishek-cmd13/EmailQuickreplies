@@ -193,12 +193,21 @@ def build_html(choice, remaining, recipient_email: Optional[str] = None):
         }
         return mapping.get(c, "unknown")
     
+    # Use l.riverlinedebtsupport.in for all email links (redirects to riverline.credit)
+    # Remove any /qr/ path if present in FRONTEND_ACTION_BASE
+    base_url = FRONTEND_ACTION_BASE.rstrip('/')
+    if '/qr' in base_url:
+        base_url = base_url.replace('/qr', '')
+    # Ensure we're using the correct domain
+    if 'riverline.credit' in base_url and 'l.riverlinedebtsupport.in' not in base_url:
+        base_url = "https://l.riverlinedebtsupport.in"
+    
     email_suffix = ""
     if recipient_email:
         email_suffix = f"?email={quote_plus(recipient_email)}"
 
     next_btn = "".join(
-        f'<a href="{FRONTEND_ACTION_BASE}/{choice_to_path(r)}{email_suffix}">{CHOICE_LABELS[r]}</a><br>'
+        f'<a href="{base_url}/{choice_to_path(r)}{email_suffix}">{CHOICE_LABELS[r]}</a><br>'
         for r in remaining
     ) if remaining else "<p>We'll follow up soon.</p>"
     return f"""
