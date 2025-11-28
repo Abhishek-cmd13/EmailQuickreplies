@@ -874,6 +874,7 @@ async def process_webhook_logic(payload: Dict[str, Any]):
 @app.post("/webhook/instantly")
 async def instantly_webhook(req: Request, bg: BackgroundTasks):
     """Fast webhook endpoint - returns immediately, processes in background"""
+    print("🔥🔥 WEBHOOK HIT — REQUEST RECEIVED 🔥🔥")
     # Log webhook reception immediately with full details
     client_ip = req.client.host if req.client else "unknown"
     host = req.headers.get("host", "unknown")
