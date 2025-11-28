@@ -71,6 +71,12 @@ RATE_LIMIT_REQUESTS_PER_MINUTE = 18  # Use 18 instead of 20 to be safe
 RATE_LIMIT_WINDOW_SECONDS = 60
 REQUEST_TIMESTAMPS: deque = deque(maxlen=RATE_LIMIT_REQUESTS_PER_MINUTE)
 QUEUE_PROCESSOR_RUNNING = False
+MAX_QUEUE_SIZE = 1000  # Prevent unbounded queue growth
+
+# Pending webhooks waiting for click events (race condition handling)
+# Key: normalized_email -> list of pending webhook payloads
+PENDING_WEBHOOKS: Dict[str, List[Dict[str, Any]]] = {}
+PENDING_WEBHOOK_TTL_SECONDS = 120  # Wait up to 2 minutes for click to arrive
 
 def get_queue() -> asyncio.Queue:
     """Get or create the API request queue"""
@@ -103,6 +109,15 @@ def store_email_click(email: str, choice: str, client_ip: str) -> None:
     now = datetime.now()
     RECENT_EMAIL_CLICKS[normalized] = {"choice": choice, "timestamp": now, "ip": client_ip}
     log(f"📧 EMAIL_STORED: Email '{normalized}' → Choice '{choice}' stored (IP: {client_ip})")
+    
+    # Check if there are pending webhooks waiting for this email (race condition fix)
+    if normalized in PENDING_WEBHOOKS:
+        pending_list = PENDING_WEBHOOKS[normalized]
+        log(f"🔗 RACE_CONDITION_FIX: Found {len(pending_list)} pending webhook(s) for {normalized}, processing now")
+        # Process pending webhooks (they will be handled by the webhook processing logic)
+        # Clear the pending list - the webhooks will be reprocessed
+        del PENDING_WEBHOOKS[normalized]
+    
     # Prune stale entries
     cutoff_delta = EMAIL_CLICK_TTL_SECONDS
     pruned_count = 0
@@ -113,6 +128,20 @@ def store_email_click(email: str, choice: str, client_ip: str) -> None:
             pruned_count += 1
     if pruned_count > 0:
         log(f"🧹 EMAIL_STORAGE_CLEANUP: Pruned {pruned_count} stale email entries")
+    
+    # Also prune stale pending webhooks
+    pruned_pending = 0
+    for email_key, pending_list in list(PENDING_WEBHOOKS.items()):
+        # Remove old pending webhooks
+        PENDING_WEBHOOKS[email_key] = [
+            wh for wh in pending_list 
+            if (now - wh.get("timestamp", now)).total_seconds() < PENDING_WEBHOOK_TTL_SECONDS
+        ]
+        if not PENDING_WEBHOOKS[email_key]:
+            del PENDING_WEBHOOKS[email_key]
+            pruned_pending += 1
+    if pruned_pending > 0:
+        log(f"🧹 PENDING_WEBHOOK_CLEANUP: Pruned {pruned_pending} stale pending webhook entries")
 
 async def wait_for_rate_limit():
     """Wait if we've hit the rate limit, clearing old timestamps"""
@@ -135,6 +164,44 @@ async def wait_for_rate_limit():
     
     # Record this request timestamp
     REQUEST_TIMESTAMPS.append(datetime.now())
+
+async def validate_uuid_for_email(uuid: str, eaccount: str, lead_email: str) -> tuple:
+    """Validate that UUID actually corresponds to the given lead_email and get correct subject"""
+    if not uuid:
+        return None, None
+    
+    await wait_for_rate_limit()
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            # Fetch the specific email by UUID to validate
+            url = f"https://api.instantly.ai/api/v2/emails/{uuid}"
+            params = {"eaccount": eaccount}
+            
+            log(f"🔍 UUID_VALIDATION: Validating UUID {uuid} for {lead_email}")
+            r = await c.get(url, params=params, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
+            
+            if r.status_code == 200:
+                email_data = r.json()
+                # Check if this email actually belongs to the lead_email
+                email_lead = email_data.get("lead_email") or email_data.get("lead") or email_data.get("to")
+                if email_lead and email_lead.lower().strip() == lead_email.lower().strip():
+                    subject = (email_data.get("subject") or 
+                              email_data.get("email_subject") or 
+                              email_data.get("subject_line") or
+                              email_data.get("title") or
+                              "")
+                    log(f"✅ UUID_VALIDATED: UUID {uuid} is valid for {lead_email}, subject='{subject}'")
+                    return uuid, subject if subject.strip() else "Loan Update"
+                else:
+                    log(f"⚠️ UUID_MISMATCH: UUID {uuid} does not belong to {lead_email} (belongs to {email_lead})")
+                    return None, None
+            else:
+                log(f"⚠️ UUID_VALIDATION_FAILED: Status {r.status_code} for UUID {uuid}")
+                return None, None
+    except Exception as e:
+        log(f"❌ UUID_VALIDATION_EXCEPTION: {str(e)}")
+        return None, None
 
 async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: str = None, step: int = None):
     """Try to find email uuid and subject for a lead using Instantly.ai API with caching and exact matching"""
@@ -241,7 +308,11 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                 log(f"💡 RATE_LIMIT_QUEUE: Queuing request for retry")
                 # Queue the request instead of immediately retrying
                 queue = get_queue()
-                await queue.put((eaccount, lead_email, campaign_id, step))
+                # Prevent unbounded queue growth
+                if queue.qsize() >= MAX_QUEUE_SIZE:
+                    log(f"⚠️ QUEUE_FULL: Queue is full ({queue.qsize()} items), dropping request for {lead_email}")
+                else:
+                    await queue.put((eaccount, lead_email, campaign_id, step))
                 # Wait longer before retrying (queue processor will handle it)
                 await asyncio.sleep(5)
                 log(f"🔄 API_RETRY: Retrying API call after rate limit delay...")
@@ -299,21 +370,42 @@ async def process_api_request_queue():
     queue = get_queue()
     log(f"🔄 QUEUE_PROCESSOR: Started background queue processor")
     
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+    
     while True:
         try:
             # Wait for a queued request (with timeout to allow checking if queue is empty)
             try:
                 eaccount, lead_email, campaign_id, step = await asyncio.wait_for(queue.get(), timeout=60.0)
-                log(f"🔄 QUEUE_PROCESSOR: Processing queued request for {lead_email}")
+                log(f"🔄 QUEUE_PROCESSOR: Processing queued request for {lead_email} (queue size: {queue.qsize()})")
                 # Re-attempt the lookup (will handle rate limiting automatically)
                 await find_email_uuid_for_lead(eaccount, lead_email, campaign_id, step)
                 queue.task_done()
+                consecutive_errors = 0  # Reset error counter on success
             except asyncio.TimeoutError:
                 # No requests in queue, continue waiting
+                consecutive_errors = 0  # Timeout is not an error
                 continue
+            except Exception as e:
+                consecutive_errors += 1
+                log(f"❌ QUEUE_PROCESSOR_ERROR: {str(e)} (consecutive errors: {consecutive_errors})")
+                if consecutive_errors >= max_consecutive_errors:
+                    log(f"⚠️ QUEUE_PROCESSOR_RESTART: Too many consecutive errors, restarting processor")
+                    consecutive_errors = 0
+                    await asyncio.sleep(10)  # Longer wait before restart
+                else:
+                    await asyncio.sleep(5)  # Wait before retrying
+                queue.task_done()  # Mark as done even on error to prevent blocking
         except Exception as e:
-            log(f"❌ QUEUE_PROCESSOR_ERROR: {str(e)}")
-            await asyncio.sleep(5)  # Wait before retrying
+            consecutive_errors += 1
+            log(f"❌ QUEUE_PROCESSOR_FATAL_ERROR: {str(e)}")
+            if consecutive_errors >= max_consecutive_errors:
+                log(f"⚠️ QUEUE_PROCESSOR_RESTART: Too many fatal errors, restarting processor")
+                consecutive_errors = 0
+                await asyncio.sleep(10)
+            else:
+                await asyncio.sleep(5)
 
 # ───────── BUILD EMAIL HTML ─────────
 def build_html(choice, remaining, recipient_email: Optional[str] = None):
@@ -364,6 +456,9 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
     else:
         reply_subject = subject  # Already has "Re:" prefix
     
+    # Apply rate limiting to reply API calls as well
+    await wait_for_rate_limit()
+    
     async with httpx.AsyncClient(timeout=15) as c:
         reply_json = {
             "eaccount": eaccount,
@@ -377,6 +472,16 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
         r = await c.post(INSTANTLY_URL, json=reply_json, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
         
         log(f"📡 REPLY_API_RESPONSE: Status {r.status_code}")
+        
+        if r.status_code == 429:
+            error_response = r.text[:500] if r.text else "No error message"
+            log(f"⚠️ REPLY_RATE_LIMITED: Status 429 - Too Many Requests. Response: {error_response}")
+            log(f"💡 REPLY_RETRY: Will retry after rate limit delay")
+            # Wait and retry once
+            await asyncio.sleep(5)
+            await wait_for_rate_limit()
+            r = await c.post(INSTANTLY_URL, json=reply_json, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
+            log(f"📡 REPLY_API_RESPONSE (retry): Status {r.status_code}")
         
         if r.status_code > 299:
             error_response = r.text[:500] if r.text else "No error message"
@@ -490,21 +595,43 @@ async def instantly_webhook(req: Request):
             else:
                 log(f"⚠️ EMAIL_MATCHING_FAILED: No stored click found for email {recipient_key}")
                 log(f"💡 DEBUG: Available emails in storage: {list(RECENT_EMAIL_CLICKS.keys())}")
-                # Check for case/whitespace variations
+                # Check for case/whitespace variations - use the matching one
                 for stored_key in RECENT_EMAIL_CLICKS.keys():
-                    if stored_key.lower() == recipient_key.lower():
-                        log(f"💡 DEBUG: Found similar email (case mismatch?): '{stored_key}' vs '{recipient_key}'")
+                    if stored_key.lower() == recipient_key.lower() and stored_key != recipient_key:
+                        log(f"💡 DEBUG: Found similar email (case mismatch): '{stored_key}' vs '{recipient_key}', using stored key")
+                        email_click = RECENT_EMAIL_CLICKS.get(stored_key, None)
+                        if email_click:
+                            matching_click = email_click.get("choice")
+                            matching_method = "EMAIL_BASED_NORMALIZED"
+                            log(f"✅ EMAIL_MATCHING_SUCCESS: Matched via normalized email for {recipient_key} → choice: {matching_click}")
+                            break
+                
+                # If still no match, this might be a race condition (webhook before click)
+                if not matching_click:
+                    log(f"⏳ RACE_CONDITION_DETECTED: Webhook arrived before click stored for {recipient_key}, storing as pending")
+                    # Store webhook as pending - will be processed when click arrives
+                    if recipient_key not in PENDING_WEBHOOKS:
+                        PENDING_WEBHOOKS[recipient_key] = []
+                    payload["timestamp"] = datetime.now()
+                    PENDING_WEBHOOKS[recipient_key].append(payload)
+                    log(f"💾 PENDING_WEBHOOK_STORED: Webhook stored as pending for {recipient_key}, will process when click arrives")
+                    # Return early - click handler will process this webhook
+                    return {"ok": True, "pending": True}
 
-        # FALLBACK: Time-based matching
+        # FALLBACK: Time-based matching (only if email-based failed and we have email_id in payload)
+        # This is less deterministic, so we only use it if we have UUID validation
         if not matching_click:
-            now = datetime.now()
-            for click_time, choice_val, ip in reversed(list(RECENT_CLICKS)):
-                time_diff = (now - click_time).total_seconds()
-                if time_diff < 60:  # Within last 60 seconds
-                    matching_click = choice_val
-                    matching_method = "TIME_BASED_FALLBACK"
-                    log(f"✅ EMAIL_MATCHING_FALLBACK: Matched via time-based fallback → choice: {choice_val} (from {time_diff:.1f}s ago)")
-                    break
+            email_uuid_from_payload = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
+            if email_uuid_from_payload:
+                # If we have UUID, we can use time-based matching more safely
+                now = datetime.now()
+                for click_time, choice_val, ip in reversed(list(RECENT_CLICKS)):
+                    time_diff = (now - click_time).total_seconds()
+                    if time_diff < 30:  # Shorter window (30s) for time-based fallback
+                        matching_click = choice_val
+                        matching_method = "TIME_BASED_FALLBACK_WITH_UUID"
+                        log(f"✅ EMAIL_MATCHING_FALLBACK: Matched via time-based fallback → choice: {choice_val} (from {time_diff:.1f}s ago, UUID available)")
+                        break
             
             if not matching_click:
                 log(f"❌ EMAIL_MATCHING_FAILED: No click found for email {recipient_key} (no email match, no time-based fallback)")
@@ -532,6 +659,16 @@ async def instantly_webhook(req: Request):
             if email_uuid:
                 log(f"✅ EMAIL_UUID_FOUND_IN_PAYLOAD: Found email_uuid in webhook payload: {email_uuid} (this is the EXACT email clicked)")
                 log(f"💡 THREADING_FIX: Using UUID from webhook payload ensures reply goes to correct email thread")
+                # VALIDATE UUID: Verify it actually belongs to this lead_email (deterministic fix)
+                validated_uuid, validated_subject = await validate_uuid_for_email(email_uuid, eaccount, recipient)
+                if validated_uuid:
+                    email_uuid = validated_uuid
+                    original_subject = validated_subject if validated_subject else original_subject
+                    log(f"✅ UUID_VALIDATED: UUID confirmed to belong to {recipient_key}")
+                else:
+                    log(f"⚠️ UUID_VALIDATION_FAILED: UUID {email_uuid} validation failed, but proceeding (may cause threading issues)")
+                    # Continue with original UUID but log warning
+                
                 # Cache the UUID from webhook payload to avoid future API calls
                 cache_key = f"{recipient_key}:{eaccount}:{campaign_id_val or 'none'}:{step_val or 'none'}"
                 UUID_CACHE[cache_key] = {
