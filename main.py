@@ -405,12 +405,20 @@ async def instantly_webhook(req: Request):
             
             if email_uuid:
                 log(f"✅ EMAIL_UUID_FOUND_IN_PAYLOAD: Found email_uuid in webhook payload: {email_uuid}")
+                # Cache the UUID from webhook payload to avoid future API calls
+                cache_key = f"{recipient_key}:{eaccount}:{campaign_id_val or 'none'}"
+                UUID_CACHE[cache_key] = {
+                    "uuid": email_uuid,
+                    "subject": original_subject,
+                    "timestamp": datetime.now()
+                }
+                log(f"💾 UUID_CACHED_FROM_PAYLOAD: Stored UUID from webhook payload")
             else:
-                log(f"🔍 EMAIL_UUID_LOOKUP_START: email_uuid not in payload, trying API lookup...")
+                log(f"🔍 EMAIL_UUID_LOOKUP_START: email_uuid not in payload, checking cache then API...")
                 log(f"🔍 EMAIL_UUID_LOOKUP_START: recipient={recipient_key}, eaccount={eaccount}, campaign_id={campaign_id_val}")
                 log(f"💡 DEBUG: Full payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}'")
                 
-                # Get email uuid and subject from Instantly.ai API (only if not in payload)
+                # Get email uuid and subject from Instantly.ai API (with caching)
                 email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val)
             
             log(f"🔍 EMAIL_UUID_LOOKUP_RESULT: uuid={email_uuid}, subject={original_subject}")
