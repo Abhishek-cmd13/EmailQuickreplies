@@ -13,7 +13,7 @@ load_dotenv()
 # ───────── CONFIG ─────────
 INSTANTLY_API_KEY     = os.getenv("INSTANTLY_API_KEY")
 INSTANTLY_EACCOUNT    = os.getenv("INSTANTLY_EACCOUNT")
-FRONTEND_ACTION_BASE  = os.getenv("FRONTEND_ACTION_BASE", "https://riverlinedebtsupport.in")
+FRONTEND_ACTION_BASE  = os.getenv("FRONTEND_ACTION_BASE", "https://l.riverlinedebtsupport.in")
 ALLOWED_CAMPAIGN_ID   = "e205ce46-f772-42fd-a81c-40eaa996f54e"
 INSTANTLY_URL         = "https://api.instantly.ai/api/v2/emails/reply"
 
@@ -92,7 +92,7 @@ def build_html(choice, remaining):
         return mapping.get(c, "unknown")
     
     next_btn = "".join(
-        f'<a href="{FRONTEND_ACTION_BASE}/l/{choice_to_path(r)}">{CHOICE_LABELS[r]}</a><br>'
+        f'<a href="{FRONTEND_ACTION_BASE}/{choice_to_path(r)}">{CHOICE_LABELS[r]}</a><br>'
         for r in remaining
     ) if remaining else "<p>We'll follow up soon.</p>"
     return f"""
@@ -233,27 +233,6 @@ async def handle_instantly_tracking(tracking_path: str, request: Request):
     # Return 204 - let Instantly.ai handle the redirect if possible
     return PlainTextResponse("", status_code=204)
 
-# ========== PATH-BASED CLICK ENDPOINT ==========
-@app.get("/l/{path_choice}")
-async def link_click(path_choice: str, request: Request):
-    """Handle path-based links like /l/settle, /l/close, /l/human"""
-    client_ip = request.client.host if request.client else "unknown"
-    
-    # Map path to choice
-    choice = PATH_TO_CHOICE.get(path_choice.lower(), "unknown")
-    
-    log(f"🔗 LINK_CLICKED: /l/{path_choice} → choice: {choice} | IP: {client_ip}")
-    
-    # Store the click with timestamp - webhook will match within 60 seconds
-    if choice != "unknown":
-        RECENT_CLICKS.append((datetime.now(), choice, client_ip))
-        log(f"💾 Stored choice {choice} - waiting for webhook (will match within 60s)")
-    else:
-        log(f"⚠️ Unknown path choice: {path_choice}")
-    
-    log(f"ℹ️ Instantly.ai will send webhook → automatic reply will be sent")
-    return PlainTextResponse("",status_code=204)  # invisible
-
 # ========== LEGACY QUERY PARAM ENDPOINT (for backwards compatibility) ==========
 @app.get("/qr")
 async def qr_click(request: Request): 
@@ -359,4 +338,25 @@ def test_webhook():
         "payload": test_payload,
         "logs_url": "/logs"
     }
+
+# ========== PATH-BASED CLICK ENDPOINT (must be last - catch-all route) ==========
+@app.get("/{path_choice}")
+async def link_click(path_choice: str, request: Request):
+    """Handle path-based links like /settle, /close, /human - catch-all route at end"""
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # Map path to choice
+    choice = PATH_TO_CHOICE.get(path_choice.lower(), "unknown")
+    
+    log(f"🔗 LINK_CLICKED: /{path_choice} → choice: {choice} | IP: {client_ip}")
+    
+    # Store the click with timestamp - webhook will match within 60 seconds
+    if choice != "unknown":
+        RECENT_CLICKS.append((datetime.now(), choice, client_ip))
+        log(f"💾 Stored choice {choice} - waiting for webhook (will match within 60s)")
+    else:
+        log(f"⚠️ Unknown path choice: {path_choice}")
+    
+    log(f"ℹ️ Instantly.ai will send webhook → automatic reply will be sent")
+    return PlainTextResponse("",status_code=204)  # invisible
 
