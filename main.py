@@ -229,14 +229,9 @@ def build_html(choice, remaining, recipient_email: Optional[str] = None):
         }
         return mapping.get(c, "unknown")
     
-    # Use l.riverlinedebtsupport.in for all email links (redirects to riverline.credit)
-    # Remove any /qr/ path if present in FRONTEND_ACTION_BASE
-    base_url = FRONTEND_ACTION_BASE.rstrip('/')
-    if '/qr' in base_url:
-        base_url = base_url.replace('/qr', '')
-    # Ensure we're using the correct domain
-    if 'riverline.credit' in base_url and 'l.riverlinedebtsupport.in' not in base_url:
-        base_url = "https://l.riverlinedebtsupport.in"
+    # ALWAYS use l.riverlinedebtsupport.in for reply email links (redirects to riverline.credit)
+    # This ensures reply emails always have the correct domain, regardless of FRONTEND_ACTION_BASE setting
+    base_url = "https://l.riverlinedebtsupport.in"
     
     email_suffix = ""
     if recipient_email:
