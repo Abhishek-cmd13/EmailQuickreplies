@@ -97,7 +97,21 @@ def store_email_click(email: str, choice: str, client_ip: str) -> None:
         log(f"🧹 EMAIL_STORAGE_CLEANUP: Pruned {pruned_count} stale email entries")
 
 async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: str = None):
-    """Try to find email uuid and subject for a lead using Instantly.ai API"""
+    """Try to find email uuid and subject for a lead using Instantly.ai API with caching"""
+    # Check cache first to avoid excessive API calls
+    # Build cache key once at the start (used throughout the function)
+    cache_key = f"{lead_email.lower()}:{eaccount}:{campaign_id or 'none'}"
+    cached = UUID_CACHE.get(cache_key)
+    if cached:
+        cache_age = (datetime.now() - cached.get("timestamp", datetime.now())).total_seconds()
+        if cache_age < UUID_CACHE_TTL_SECONDS:
+            log(f"✅ UUID_CACHE_HIT: Found cached UUID for {lead_email} (age {cache_age:.1f}s)")
+            return cached.get("uuid"), cached.get("subject")
+        else:
+            # Cache expired, remove it
+            del UUID_CACHE[cache_key]
+            log(f"🧹 UUID_CACHE_EXPIRED: Removed stale cache for {lead_email}")
+    
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             # Correct endpoint: /api/v2/emails (not /list)
