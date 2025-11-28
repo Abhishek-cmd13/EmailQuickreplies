@@ -17,7 +17,6 @@ INSTANTLY_API_KEY     = os.getenv("INSTANTLY_API_KEY")
 INSTANTLY_EACCOUNT    = os.getenv("INSTANTLY_EACCOUNT")
 FRONTEND_ACTION_BASE  = os.getenv("FRONTEND_ACTION_BASE", "https://l.riverlinedebtsupport.in")
 BACKEND_BASE_URL      = os.getenv("BACKEND_BASE_URL", "https://riverline.credit")
-ALLOWED_CAMPAIGN_ID   = "e205ce46-f772-42fd-a81c-40eaa996f54e"
 INSTANTLY_URL         = "https://api.instantly.ai/api/v2/emails/reply"
 
 if not INSTANTLY_API_KEY or not INSTANTLY_EACCOUNT:
@@ -1246,7 +1245,6 @@ def status():
     """Check webhook configuration status"""
     return {
         "webhook_url": f"{BACKEND_BASE_URL}/webhook/instantly",
-        "campaign_id": ALLOWED_CAMPAIGN_ID,
         "frontend_action_base": FRONTEND_ACTION_BASE,
         "backend_base_url": BACKEND_BASE_URL,
         "click_endpoints": {
@@ -1302,7 +1300,7 @@ def test_webhook():
         "event_type": "link_clicked",
         "lead_email": "test@example.com",
         "unibox_url": None,
-        "campaign_id": ALLOWED_CAMPAIGN_ID,
+        "campaign_id": "test-campaign-12345",
         "campaign_name": "Test Campaign",
         "email_account": INSTANTLY_EACCOUNT or "test@example.com"
     }
