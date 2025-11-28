@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List
 from collections import deque
 from urllib.parse import quote_plus
+import asyncio
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -62,6 +63,23 @@ EMAIL_CLICK_TTL_SECONDS = 3600  # one hour safety window
 UUID_CACHE: Dict[str, Dict[str, Any]] = {}
 UUID_CACHE_TTL_SECONDS = 3600  # Cache UUIDs for 1 hour
 
+# Request queue for rate limiting (429 errors)
+# Queue for UUID lookup requests that need to be processed with rate limiting
+# Note: asyncio.Queue() will be initialized in startup event
+_api_request_queue: Optional[asyncio.Queue] = None
+RATE_LIMIT_REQUESTS_PER_MINUTE = 18  # Use 18 instead of 20 to be safe
+RATE_LIMIT_WINDOW_SECONDS = 60
+REQUEST_TIMESTAMPS: deque = deque(maxlen=RATE_LIMIT_REQUESTS_PER_MINUTE)
+QUEUE_PROCESSOR_RUNNING = False
+
+def get_queue() -> asyncio.Queue:
+    """Get or create the API request queue"""
+    global _api_request_queue
+    if _api_request_queue is None:
+        # Create queue (event loop will be available in async context)
+        _api_request_queue = asyncio.Queue()
+    return _api_request_queue
+
 # Paths to exclude from email click tracking logs
 NON_EMAIL_PATHS = {"/logs", "/status", "/test", "/qr", "/favicon.ico", "/lt", "/webhook", "/robots.txt", "/.well-known"}
 
@@ -96,11 +114,33 @@ def store_email_click(email: str, choice: str, client_ip: str) -> None:
     if pruned_count > 0:
         log(f"🧹 EMAIL_STORAGE_CLEANUP: Pruned {pruned_count} stale email entries")
 
-async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: str = None):
-    """Try to find email uuid and subject for a lead using Instantly.ai API with caching"""
+async def wait_for_rate_limit():
+    """Wait if we've hit the rate limit, clearing old timestamps"""
+    now = datetime.now()
+    # Remove timestamps older than the rate limit window
+    while REQUEST_TIMESTAMPS and (now - REQUEST_TIMESTAMPS[0]).total_seconds() >= RATE_LIMIT_WINDOW_SECONDS:
+        REQUEST_TIMESTAMPS.popleft()
+    
+    # If we're at the limit, wait until we can make another request
+    if len(REQUEST_TIMESTAMPS) >= RATE_LIMIT_REQUESTS_PER_MINUTE:
+        oldest_ts = REQUEST_TIMESTAMPS[0]
+        wait_seconds = RATE_LIMIT_WINDOW_SECONDS - (now - oldest_ts).total_seconds() + 1
+        if wait_seconds > 0:
+            log(f"⏳ RATE_LIMIT_WAIT: Waiting {wait_seconds:.1f}s before next API request (at limit)")
+            await asyncio.sleep(wait_seconds)
+            # Re-check and remove expired timestamps after waiting
+            now = datetime.now()
+            while REQUEST_TIMESTAMPS and (now - REQUEST_TIMESTAMPS[0]).total_seconds() >= RATE_LIMIT_WINDOW_SECONDS:
+                REQUEST_TIMESTAMPS.popleft()
+    
+    # Record this request timestamp
+    REQUEST_TIMESTAMPS.append(datetime.now())
+
+async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: str = None, step: int = None):
+    """Try to find email uuid and subject for a lead using Instantly.ai API with caching and exact matching"""
     # Check cache first to avoid excessive API calls
-    # Build cache key once at the start (used throughout the function)
-    cache_key = f"{lead_email.lower()}:{eaccount}:{campaign_id or 'none'}"
+    # Build cache key including step for more precise matching
+    cache_key = f"{lead_email.lower()}:{eaccount}:{campaign_id or 'none'}:{step or 'none'}"
     cached = UUID_CACHE.get(cache_key)
     if cached:
         cache_age = (datetime.now() - cached.get("timestamp", datetime.now())).total_seconds()
@@ -112,6 +152,9 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
             del UUID_CACHE[cache_key]
             log(f"🧹 UUID_CACHE_EXPIRED: Removed stale cache for {lead_email}")
     
+    # Wait for rate limit if needed
+    await wait_for_rate_limit()
+    
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             # Correct endpoint: /api/v2/emails (not /list)
@@ -122,9 +165,13 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
             }
             if campaign_id:
                 params["campaign_id"] = campaign_id
+            # Note: step parameter may not be supported by API, but we'll filter manually
             
             log(f"🔍 API_CALL_START: GET {url}")
             log(f"📋 API_PARAMS: {params}")
+            if step:
+                log(f"📋 FILTERING: Will filter results by step={step} for exact matching")
+            
             r = await c.get(url, params=params, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
             
             log(f"📡 API_RESPONSE: Status {r.status_code}")
@@ -136,28 +183,43 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                 log(f"📧 API_RESULT: Found {len(emails)} email(s) for {lead_email}")
                 
                 if emails:
-                    # Sort by timestamp_created (most recent first)
+                    # Filter by step if provided (for exact matching)
+                    if step is not None:
+                        filtered = [e for e in emails if e.get("step") == step]
+                        if filtered:
+                            log(f"✅ STEP_FILTER_MATCH: Found {len(filtered)} email(s) matching step={step}")
+                            emails = filtered
+                    
+                    # Sort by timestamp_created (most recent first) but prefer emails matching campaign_id
+                    if campaign_id:
+                        # Prioritize emails from the same campaign
+                        campaign_emails = [e for e in emails if e.get("campaign_id") == campaign_id]
+                        if campaign_emails:
+                            log(f"✅ CAMPAIGN_FILTER_MATCH: Found {len(campaign_emails)} email(s) matching campaign_id")
+                            emails = campaign_emails
+                    
+                    # Now sort by timestamp_created (most recent first)
                     emails.sort(key=lambda x: x.get("timestamp_created", x.get("timestamp_email", "")), reverse=True)
-                    latest = emails[0]
+                    target_email = emails[0]
+                    
                     # API returns "id" field as the uuid
-                    uuid = latest.get("id")
+                    uuid = target_email.get("id")
                     # Try multiple possible subject fields from Instantly.ai API
-                    subject = (latest.get("subject") or 
-                              latest.get("email_subject") or 
-                              latest.get("subject_line") or
-                              latest.get("title") or
+                    subject = (target_email.get("subject") or 
+                              target_email.get("email_subject") or 
+                              target_email.get("subject_line") or
+                              target_email.get("title") or
                               "")
                     
-                    # Log all available fields for debugging
-                    log(f"💡 DEBUG: Latest email keys: {list(latest.keys())}")
-                    log(f"💡 DEBUG: Subject fields - subject='{latest.get('subject')}', email_subject='{latest.get('email_subject')}', subject_line='{latest.get('subject_line')}', title='{latest.get('title')}'")
+                    log(f"💡 DEBUG: Selected email - step={target_email.get('step')}, campaign_id={target_email.get('campaign_id')}, timestamp={target_email.get('timestamp_created')}")
+                    log(f"💡 DEBUG: Subject fields - subject='{target_email.get('subject')}', email_subject='{target_email.get('email_subject')}', subject_line='{target_email.get('subject_line')}', title='{target_email.get('title')}'")
                     
                     if not subject or not subject.strip():
                         log(f"⚠️ WARNING: Subject is empty in API response - this will cause threading issues")
-                        log(f"💡 DEBUG: Full email object (first 500 chars): {json.dumps(latest, indent=2)[:500]}")
+                        log(f"💡 DEBUG: Full email object (first 500 chars): {json.dumps(target_email, indent=2)[:500]}")
                         subject = "Loan Update"  # Fallback - but this is not ideal
                     else:
-                        log(f"✅ UUID_FOUND: uuid={uuid}, subject={subject}")
+                        log(f"✅ UUID_FOUND: uuid={uuid}, subject={subject}, step={target_email.get('step')}")
                     
                     # Cache the UUID to avoid future API calls
                     UUID_CACHE[cache_key] = {
@@ -176,11 +238,15 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
             elif r.status_code == 429:
                 error_text = r.text[:500] if r.text else "No error message"
                 log(f"⚠️ API_RATE_LIMITED: Status 429 - Too Many Requests. Error: {error_text}")
-                log(f"💡 RATE_LIMIT_INFO: Instantly.ai allows max 20 requests per minute. Waiting and retrying...")
-                # Wait 3 seconds and retry once
-                import asyncio
-                await asyncio.sleep(3)
+                log(f"💡 RATE_LIMIT_QUEUE: Queuing request for retry")
+                # Queue the request instead of immediately retrying
+                queue = get_queue()
+                await queue.put((eaccount, lead_email, campaign_id, step))
+                # Wait longer before retrying (queue processor will handle it)
+                await asyncio.sleep(5)
                 log(f"🔄 API_RETRY: Retrying API call after rate limit delay...")
+                # Retry once after delay
+                await wait_for_rate_limit()
                 r = await c.get(url, params=params, headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"})
                 log(f"📡 API_RESPONSE (retry): Status {r.status_code}")
                 if r.status_code == 200:
@@ -188,6 +254,15 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
                     emails = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
                     log(f"📧 API_RESULT (retry): Found {len(emails)} email(s) for {lead_email}")
                     if emails:
+                        # Apply same filtering logic
+                        if step is not None:
+                            filtered = [e for e in emails if e.get("step") == step]
+                            if filtered:
+                                emails = filtered
+                        if campaign_id:
+                            campaign_emails = [e for e in emails if e.get("campaign_id") == campaign_id]
+                            if campaign_emails:
+                                emails = campaign_emails
                         emails.sort(key=lambda x: x.get("timestamp_created", x.get("timestamp_email", "")), reverse=True)
                         latest = emails[0]
                         uuid = latest.get("id")
@@ -214,6 +289,31 @@ async def find_email_uuid_for_lead(eaccount: str, lead_email: str, campaign_id: 
         log(f"❌ EXCEPTION: {str(e)}")
         log(f"💡 TRACEBACK: {traceback.format_exc()[:500]}")
     return None, None
+
+async def process_api_request_queue():
+    """Background task to process queued API requests with rate limiting"""
+    global QUEUE_PROCESSOR_RUNNING
+    if QUEUE_PROCESSOR_RUNNING:
+        return
+    QUEUE_PROCESSOR_RUNNING = True
+    queue = get_queue()
+    log(f"🔄 QUEUE_PROCESSOR: Started background queue processor")
+    
+    while True:
+        try:
+            # Wait for a queued request (with timeout to allow checking if queue is empty)
+            try:
+                eaccount, lead_email, campaign_id, step = await asyncio.wait_for(queue.get(), timeout=60.0)
+                log(f"🔄 QUEUE_PROCESSOR: Processing queued request for {lead_email}")
+                # Re-attempt the lookup (will handle rate limiting automatically)
+                await find_email_uuid_for_lead(eaccount, lead_email, campaign_id, step)
+                queue.task_done()
+            except asyncio.TimeoutError:
+                # No requests in queue, continue waiting
+                continue
+        except Exception as e:
+            log(f"❌ QUEUE_PROCESSOR_ERROR: {str(e)}")
+            await asyncio.sleep(5)  # Wait before retrying
 
 # ───────── BUILD EMAIL HTML ─────────
 def build_html(choice, remaining, recipient_email: Optional[str] = None):
@@ -294,6 +394,15 @@ async def reply(eaccount: str, reply_to_uuid: str, subject: str, html: str):
 
 # ========== WEBHOOK ==========
 app = FastAPI()
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on application startup"""
+    # Initialize the queue
+    get_queue()
+    # Start the queue processor in the background
+    asyncio.create_task(process_api_request_queue())
+    log(f"🚀 APP_STARTUP: Queue processor started")
 
 # Middleware to log ONLY email click tracking GET requests
 @app.middleware("http")
@@ -407,28 +516,38 @@ async def instantly_webhook(req: Request):
             # Get email_account and campaign_id from webhook payload
             eaccount = payload.get("email_account") or INSTANTLY_EACCOUNT
             campaign_id_val = campaign_id if campaign_id != "unknown" else None
+            step_val = payload.get("step")
+            if isinstance(step_val, (int, str)):
+                try:
+                    step_val = int(step_val)
+                except (ValueError, TypeError):
+                    step_val = None
+            else:
+                step_val = None
             
-            # First, check if webhook payload contains email_id/uuid directly (avoids API rate limits)
+            # PRIORITY 1: Check if webhook payload contains email_id/uuid directly (THIS IS THE EXACT EMAIL CLICKED)
             email_uuid = payload.get("email_id") or payload.get("email_uuid") or payload.get("uuid")
             original_subject = payload.get("subject", "Loan Update")
             
             if email_uuid:
-                log(f"✅ EMAIL_UUID_FOUND_IN_PAYLOAD: Found email_uuid in webhook payload: {email_uuid}")
+                log(f"✅ EMAIL_UUID_FOUND_IN_PAYLOAD: Found email_uuid in webhook payload: {email_uuid} (this is the EXACT email clicked)")
+                log(f"💡 THREADING_FIX: Using UUID from webhook payload ensures reply goes to correct email thread")
                 # Cache the UUID from webhook payload to avoid future API calls
-                cache_key = f"{recipient_key}:{eaccount}:{campaign_id_val or 'none'}"
+                cache_key = f"{recipient_key}:{eaccount}:{campaign_id_val or 'none'}:{step_val or 'none'}"
                 UUID_CACHE[cache_key] = {
                     "uuid": email_uuid,
                     "subject": original_subject,
                     "timestamp": datetime.now()
                 }
-                log(f"💾 UUID_CACHED_FROM_PAYLOAD: Stored UUID from webhook payload")
+                log(f"💾 UUID_CACHED_FROM_PAYLOAD: Stored UUID from webhook payload with step={step_val}")
             else:
                 log(f"🔍 EMAIL_UUID_LOOKUP_START: email_uuid not in payload, checking cache then API...")
-                log(f"🔍 EMAIL_UUID_LOOKUP_START: recipient={recipient_key}, eaccount={eaccount}, campaign_id={campaign_id_val}")
-                log(f"💡 DEBUG: Full payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}'")
+                log(f"🔍 EMAIL_UUID_LOOKUP_START: recipient={recipient_key}, eaccount={eaccount}, campaign_id={campaign_id_val}, step={step_val}")
+                log(f"💡 DEBUG: Full payload email_account='{payload.get('email_account')}', campaign_id='{campaign_id}', step='{step_val}'")
+                log(f"⚠️ WARNING: Webhook missing email_id - will fetch from API (may not match exact clicked email)")
                 
-                # Get email uuid and subject from Instantly.ai API (with caching)
-                email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val)
+                # Get email uuid and subject from Instantly.ai API (with caching and step filtering for exact match)
+                email_uuid, original_subject = await find_email_uuid_for_lead(eaccount, recipient, campaign_id_val, step_val)
             
             log(f"🔍 EMAIL_UUID_LOOKUP_RESULT: uuid={email_uuid}, subject={original_subject}")
             
