@@ -908,6 +908,15 @@ def logs_get_requests():
             "Matched",
             "REPLY_SENT",
             "REPLY_FAILED",
+            "REPLY_START",
+            "REPLY_API",
+            "REPLY_RESPONSE",
+            "REPLY_SUCCESS",
+            "REPLY_ERROR",
+            "REPLY_WARNING",
+            "REPLY_VERIFIED",
+            "REPLY_DETAILS",
+            "REPLY_PREPARATION",
             "WEBHOOK",  # Matches WEBHOOK_HEADERS, WEBHOOK EVENT, WEBHOOK_RESPONSE, etc.
             "webhook",  # Case-insensitive match
             "link_clicked",  # Event type from Instantly.ai
